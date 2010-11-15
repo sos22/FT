@@ -1,0 +1,45 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: This patch stops the error handling code trying to match object 
+## DP: and function names against a suppression if it wasn't able to 
+## DP: obtain the relevant name.
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-2.2.0+2.4.0rc1.orig/coregrind/vg_errcontext.c valgrind-2.2.0+2.4.0rc1/coregrind/vg_errcontext.c
+--- valgrind-2.2.0+2.4.0rc1.orig/coregrind/vg_errcontext.c	2005-03-04 05:37:46.000000000 +0000
++++ valgrind-2.2.0+2.4.0rc1/coregrind/vg_errcontext.c	2005-03-09 19:24:38.000000000 +0000
+@@ -979,12 +979,14 @@
+       vg_assert(su->callers[i].name != NULL);
+       switch (su->callers[i].ty) {
+          case ObjName: 
+-            (void)VG_(get_objname)(a, caller_name, M_VG_ERRTXT);
++            if (!VG_(get_objname)(a, caller_name, M_VG_ERRTXT))
++               return False;
+             break; 
+ 
+          case FunName: 
+             // Nb: mangled names used in suppressions
+-            (void)VG_(get_fnname_nodemangle)(a, caller_name, M_VG_ERRTXT);
++            if (!VG_(get_fnname_nodemangle)(a, caller_name, M_VG_ERRTXT))
++               return False;
+             break;
+          default: VG_(skin_panic)("supp_matches_callers");
+       }

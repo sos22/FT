@@ -1,0 +1,70 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Don't use .valgrindrc file unless read by the owner 
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-3.3.1.orig/coregrind/m_commandline.c valgrind-3.3.1/coregrind/m_commandline.c
+--- valgrind-3.3.1.orig/coregrind/m_commandline.c	2008-06-01 01:39:05.000000000 +0000
++++ valgrind-3.3.1/coregrind/m_commandline.c	2008-12-03 16:54:55.000000000 +0000
+@@ -56,25 +56,30 @@
+ static HChar* read_dot_valgrindrc ( HChar* dir )
+ {
+    Int    n;
+-   SysRes fd;
++   struct vki_stat st;
++   SysRes fd, res;
+    Int    size;
+    HChar* f_clo = NULL;
+    HChar  filename[VKI_PATH_MAX];
+ 
+    VG_(snprintf)(filename, VKI_PATH_MAX, "%s/.valgrindrc", 
+                            ( NULL == dir ? "" : dir ) );
+-   fd = VG_(open)(filename, 0, VKI_S_IRUSR);
+-   if ( !fd.isError ) {
+-      size = VG_(fsize)(fd.res);
+-      if (size > 0) {
+-         f_clo = VG_(malloc)(size+1);
+-         vg_assert(f_clo);
+-         n = VG_(read)(fd.res, f_clo, size);
+-         if (n == -1) n = 0;
+-         vg_assert(n >= 0 && n <= size+1);
+-         f_clo[n] = '\0';
+-      }
+-      VG_(close)(fd.res);
++
++   res = VG_(stat)(filename, &st);
++   if (st.st_uid == VG_(geteuid)() && st.st_mode != VKI_S_IWOTH) {
++        fd = VG_(open)(filename, 0, VKI_S_IRUSR);
++        if ( !fd.isError ) {
++        size = VG_(fsize)(fd.res);
++        if (size > 0) {
++                f_clo = VG_(malloc)(size+1);
++                vg_assert(f_clo);
++                n = VG_(read)(fd.res, f_clo, size);
++                if (n == -1) n = 0;
++                vg_assert(n >= 0 && n <= size+1);
++                f_clo[n] = '\0';
++        }
++        VG_(close)(fd.res);
++        }
+    }
+    return f_clo;
+ }

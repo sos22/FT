@@ -1,0 +1,35 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Adds reference to AUTHORS file on valgrind.1 
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-3.3.0.orig/docs/valgrind.1 valgrind-3.3.0/docs/valgrind.1
+--- valgrind-3.3.0.orig/docs/valgrind.1	2007-12-11 00:23:01.000000000 +0000
++++ valgrind-3.3.0/docs/valgrind.1	2007-12-12 17:14:31.000000000 +0000
+@@ -720,6 +720,8 @@
+ \fI/usr/share/doc/valgrind/html/index.html\fR, and/or
+ \fIhttp://www.valgrind.org/docs/manual/index.html\fR.
+ .SH "AUTHOR"
++Julian Seward <jseward@acm.org> is the original author of valgrind
++and there are other contributors listed on /usr/share/doc/valgrind/AUTHORS.
+ .PP
+ This manpage has been written by Andres Roldan <aroldan@debian.org> for the Debian Project, but can be used for any other distribution.
+ .PP

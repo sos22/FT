@@ -1,0 +1,71 @@
+#!/usr/bin/make -f
+
+include /usr/share/dpatch/dpatch.make
+
+config.sub config.guess: %: /usr/share/misc/%
+	cp -a $< $@
+
+config.status: config.sub config.guess
+	dh_testdir
+	cat xfree-4.supp debian/debian.supp > debian.supp
+	./configure --prefix=/usr \
+		--mandir=\$${prefix}/share/man
+
+build: patch build-stamp
+
+build-stamp:  config.status
+	dh_testdir
+	$(MAKE)
+	touch build-stamp
+
+clean: clean1 unpatch
+clean1: unpatch
+	dh_testdir
+	dh_testroot
+	rm -f build-stamp 
+	-$(MAKE) distclean
+	dh_clean
+
+target=$(CURDIR)/debian/valgrind
+install: build
+	dh_testdir
+	dh_testroot
+	dh_clean -k
+	dh_installdirs 
+
+	$(MAKE) install prefix=$(CURDIR)/debian/valgrind/usr
+
+	# Debian stuff
+	cp -f debian/debian-libc6-dbg.supp $(target)/usr/lib/valgrind
+	mv -f $(target)/usr/bin/valgrind $(target)/usr/bin/valgrind.bin
+	cp -f debian/valgrind.sh $(target)/usr/bin/valgrind
+	chown root.root $(target)/usr/bin/valgrind.bin $(target)/usr/bin/valgrind
+	chmod 755 $(target)/usr/bin/valgrind.bin $(target)/usr/bin/valgrind
+
+	install -p -m644 debian.supp $(target)/usr/lib/valgrind
+	install -p -d -m755 $(target)/usr/share/doc/valgrind/html
+	install -p -d -m755 $(target)/usr/share/lintian/overrides
+	install -p -m644 debian/overrides $(target)/usr/share/lintian/overrides/valgrind
+
+
+binary-indep: build install
+
+binary-arch: build install
+	dh_testdir
+	dh_testroot
+	dh_installdocs
+	dh_installexamples
+	dh_installmenu
+	dh_installchangelogs NEWS
+	dh_link
+	#dh_strip
+	dh_compress
+	dh_fixperms
+	dh_installdeb
+	dh_shlibdeps
+	dh_gencontrol
+	dh_md5sums
+	dh_builddeb
+
+binary: binary-indep binary-arch
+.PHONY: build clean binary-indep binary-arch binary install patch unpatch 

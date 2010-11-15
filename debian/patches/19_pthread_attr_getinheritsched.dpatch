@@ -1,0 +1,54 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Add a dummy implementation of pthread_attr_getinheritsched. 
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-2.2.0.orig/coregrind/vg_libpthread.c valgrind-2.2.0/coregrind/vg_libpthread.c
+--- valgrind-2.2.0.orig/coregrind/vg_libpthread.c	2004-11-16 18:13:44.000000000 +0000
++++ valgrind-2.2.0/coregrind/vg_libpthread.c	2004-11-16 18:22:28.000000000 +0000
+@@ -444,6 +444,15 @@
+    return 0;
+ }
+ 
++int pthread_attr_getinheritsched(const pthread_attr_t *attr, int *inherit)
++{
++   static int moans = N_MOANS;
++   if (moans-- > 0)
++      kludged("pthread_attr_getinheritsched", NULL);
++   *inherit = PTHREAD_EXPLICIT_SCHED;
++   return 0;
++}
++
+ int pthread_attr_setinheritsched(pthread_attr_t *attr, int inherit)
+ {
+    static int moans = N_MOANS;
+diff -urN valgrind-2.2.0.orig/coregrind/vg_libpthread_unimp.c valgrind-2.2.0/coregrind/vg_libpthread_unimp.c
+--- valgrind-2.2.0.orig/coregrind/vg_libpthread_unimp.c	2004-11-16 18:13:44.000000000 +0000
++++ valgrind-2.2.0/coregrind/vg_libpthread_unimp.c	2004-11-16 18:22:41.000000000 +0000
+@@ -95,7 +95,7 @@
+ //void pthread_atfork ( void )  { unimp("pthread_atfork"); }
+ //void pthread_attr_destroy ( void )  { unimp("pthread_attr_destroy"); }
+ //void pthread_attr_getdetachstate ( void )  { unimp("pthread_attr_getdetachstate"); }
+-void pthread_attr_getinheritsched ( void )  { unimp("pthread_attr_getinheritsched"); }
++//void pthread_attr_getinheritsched ( void )  { unimp("pthread_attr_getinheritsched"); }
+ //void pthread_attr_getschedparam ( void )  { unimp("pthread_attr_getschedparam"); }
+ //void pthread_attr_getschedpolicy ( void )  { unimp("pthread_attr_getschedpolicy"); }
+ //void pthread_attr_getscope ( void )  { unimp("pthread_attr_getscope"); }

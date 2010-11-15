@@ -1,0 +1,133 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Adds support for readdir syscall. Bug#237996 
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-2.2.0.orig/coregrind/vg_syscalls.c valgrind-2.2.0/coregrind/vg_syscalls.c
+--- valgrind-2.2.0.orig/coregrind/vg_syscalls.c	2004-09-10 21:35:49.000000000 +0000
++++ valgrind-2.2.0/coregrind/vg_syscalls.c	2004-09-10 21:40:02.000000000 +0000
+@@ -2912,6 +2912,14 @@
+       SYSCALL_TRACK( pre_mem_read, tid, "ioctl(TIOCSWINSZ)", arg3, 
+ 		     sizeof(struct winsize) );
+       break;
++   case TIOCMBIS:
++      SYSCALL_TRACK( pre_mem_read, tid, "ioctl(TIOCMBIS)",
++                    arg3, sizeof(int) );
++      break;
++   case TIOCMBIC:
++      SYSCALL_TRACK( pre_mem_read, tid, "ioctl(TIOCMBIC)",
++                    arg3, sizeof(int) );
++      break;
+    case TIOCLINUX:
+       SYSCALL_TRACK( pre_mem_read, tid, "ioctl(TIOCLINUX)", arg3, 
+ 		     sizeof(char *) );
+@@ -2994,6 +3002,16 @@
+       SYSCALL_TRACK( pre_mem_read, tid, "ioctl(SG_GET_VERSION_NUM)", 
+ 		     arg3, sizeof(int) );
+       break;
++   case SG_EMULATED_HOST: /* 0x2203 */
++      SYSCALL_TRACK( pre_mem_write, tid,
++                    "ioctl(SG_EMULATED_HOST)", arg3,
++                    sizeof(int) );
++      break;
++   case SG_GET_SG_TABLESIZE: /* 0x227f */
++      SYSCALL_TRACK( pre_mem_write, tid,
++                    "ioctl(SG_GET_SG_TABLESIZE)",
++                    arg3, sizeof(int) );
++      break;
+ #       endif
+ 
+    case VKI_IIOCGETCPS:
+@@ -3383,6 +3401,26 @@
+ 		     "ioctl(CDROMREADTOCENTRY)", arg3, 
+ 		     sizeof(struct cdrom_tocentry));
+       break;
++   case CDROMMULTISESSION: /* 0x5310 */
++      SYSCALL_TRACK( pre_mem_write,tid,
++                    "ioctl(CDROMMULTISESSION)", arg3,
++                    sizeof(struct cdrom_multisession));
++      break;
++   case CDROMVOLREAD: /* 0x5313 */
++      SYSCALL_TRACK( pre_mem_write,tid,
++                    "ioctl(CDROMVOLREAD)", arg3,
++                    sizeof(struct cdrom_volctrl));
++      break;
++   case CDROMREADAUDIO: /* 0x530e */
++      SYSCALL_TRACK( pre_mem_read,tid,
++                    "ioctl(CDROMREADAUDIO)", arg3,
++                    sizeof (struct cdrom_read_audio));
++      if ( arg3 ) {
++         struct cdrom_read_audio *cra = (struct cdrom_read_audio *) arg3;
++        SYSCALL_TRACK( pre_mem_write, tid, "ioctl(CDROMREADAUDIO).buf",
++                    (Addr)(cra->buf), (UInt)(cra->nframes * CD_FRAMESIZE_RAW));
++      }
++      break;
+    case CDROMPLAYMSF:
+       SYSCALL_TRACK( pre_mem_read,tid, "ioctl(CDROMPLAYMSF)", arg3, 
+ 		     sizeof(struct cdrom_msf));
+@@ -3586,6 +3624,9 @@
+       break;
+    case TIOCSWINSZ:
+       break;
++   case TIOCMBIS:
++   case TIOCMBIC:
++      break;
+    case TIOCLINUX:
+       if (res == 0)
+ 	 VG_TRACK( post_mem_write, arg3, sizeof(char *) );
+@@ -3647,6 +3688,14 @@
+       break;
+    case SG_GET_VERSION_NUM:
+       break;
++   case SG_EMULATED_HOST:
++      if (res == 0)
++         VG_TRACK( post_mem_write,arg3, sizeof(int));
++      break;
++   case SG_GET_SG_TABLESIZE:
++      if (res == 0)
++         VG_TRACK( post_mem_write,arg3, sizeof(int));
++      break;
+ #       endif
+ 
+    case VKI_IIOCGETCPS:
+@@ -3908,6 +3957,22 @@
+       if (res == 0)
+ 	 VG_TRACK( post_mem_write,arg3, sizeof(struct cdrom_tochdr));
+       break;
++   case CDROMMULTISESSION:
++      if (res == 0)
++         VG_TRACK( post_mem_write,arg3, sizeof(struct cdrom_multisession));
++      break;
++   case CDROMVOLREAD:
++      if (res == 0)
++         VG_TRACK( post_mem_write,arg3, sizeof(struct cdrom_volctrl));
++      break;
++   case CDROMREADAUDIO:
++      if (res == 0 && arg3 ) {
++         struct cdrom_read_audio *cra = (struct cdrom_read_audio *) arg3;
++        if (cra->buf != NULL)
++           VG_TRACK( post_mem_write, (Addr)(cra->buf),
++                     (UInt)(cra->nframes * CD_FRAMESIZE_RAW));
++      }
++      break;
+    case CDROMPLAYMSF:
+       break;
+       /* The following two are probably bogus (should check args

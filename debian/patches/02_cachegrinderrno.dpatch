@@ -1,0 +1,47 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: This patch makes cachegrind report the reason why it was unable 
+## DP: to open the output file.
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-2.2.0.orig/cachegrind/cg_main.c valgrind-2.2.0/cachegrind/cg_main.c
+--- valgrind-2.2.0.orig/cachegrind/cg_main.c	2004-10-14 13:48:20.000000000 +0000
++++ valgrind-2.2.0/cachegrind/cg_main.c	2004-10-14 13:49:49.000000000 +0000
+@@ -41,6 +41,8 @@
+ 
+ #include "cg_sim.c"
+ 
++#include <errno.h>
++
+ /*------------------------------------------------------------*/
+ /*--- Constants                                            ---*/
+ /*------------------------------------------------------------*/
+@@ -1089,8 +1091,8 @@
+ static void file_err ( void )
+ {
+    VG_(message)(Vg_UserMsg,
+-      "error: can't open cache simulation output file `%s'",
+-      cachegrind_out_file );
++      "error: can't open cache simulation output file `%s': %s",
++      cachegrind_out_file, strerror(errno) );
+    VG_(message)(Vg_UserMsg,
+       "       ... so simulation results will be missing.");
+ }

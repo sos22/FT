@@ -1,0 +1,100 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Add a dummy implementation of pthread_condattr_getpshared and
+## DP: pthread_condattr_setpshared.
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-2.2.0.orig/coregrind/vg_libpthread.c valgrind-2.2.0/coregrind/vg_libpthread.c
+--- valgrind-2.2.0.orig/coregrind/vg_libpthread.c	2004-11-16 18:22:28.000000000 +0000
++++ valgrind-2.2.0/coregrind/vg_libpthread.c	2004-11-16 18:26:21.000000000 +0000
+@@ -138,6 +138,16 @@
+    int __vg_mutexkind;
+ } vg_pthread_mutexattr_t;
+ 
++typedef struct
++{
++  /* Combination of values:
++
++     Bit 0  : flag whether conditional variable will be shareable between
++              processes.
++   */
++  int __vg_value;
++} vg_pthread_condattr_t;
++
+ typedef struct _vg_pthread_rwlock_t
+ {
+    struct _vg_pthread_fastlock __vg_rw_lock; /* Lock to guarantee mutual exclusion */
+@@ -1403,6 +1413,10 @@
+ 
+ int pthread_condattr_init(pthread_condattr_t *attr)
+ {
++   vg_pthread_condattr_t* vg_attr;
++   CONVERT(condattr, attr, vg_attr);
++
++   memset (vg_attr, '\0', sizeof (*vg_attr));
+    return 0;
+ }
+ 
+@@ -1411,6 +1425,29 @@
+    return 0;
+ }
+ 
++int pthread_condattr_setpshared(pthread_condattr_t *attr, int pshared)
++{
++   vg_pthread_condattr_t* vg_attr;
++   CONVERT(condattr, attr, vg_attr);
++
++   if (pshared != PTHREAD_PROCESS_PRIVATE &&
++       pshared != PTHREAD_PROCESS_SHARED)
++      return EINVAL;
++
++   int *valuep = &(vg_attr->__vg_value);
++   *valuep = (*valuep & ~1) | (pshared != PTHREAD_PROCESS_PRIVATE);
++   return 0;
++}
++
++int pthread_condattr_getpshared (const pthread_condattr_t *attr, int *pshared)
++{
++   vg_pthread_condattr_t* vg_attr;
++   CONVERT(condattr, attr, vg_attr);
++
++   *pshared = vg_attr->__vg_value & 1;
++   return 0;
++}
++
+ int pthread_cond_init( pthread_cond_t *cond,
+ 		       const pthread_condattr_t *cond_attr)
+ {
+diff -urN valgrind-2.2.0.orig/coregrind/vg_libpthread_unimp.c valgrind-2.2.0/coregrind/vg_libpthread_unimp.c
+--- valgrind-2.2.0.orig/coregrind/vg_libpthread_unimp.c	2004-11-16 18:22:41.000000000 +0000
++++ valgrind-2.2.0/coregrind/vg_libpthread_unimp.c	2004-11-16 18:26:42.000000000 +0000
+@@ -119,9 +119,9 @@
+ //void pthread_cond_timedwait ( void )  { unimp("pthread_cond_timedwait"); }
+ //void pthread_cond_wait ( void )  { unimp("pthread_cond_wait"); }
+ //void pthread_condattr_destroy ( void )  { unimp("pthread_condattr_destroy"); }
+-void pthread_condattr_getpshared ( void )  { unimp("pthread_condattr_getpshared"); }
++//void pthread_condattr_getpshared ( void )  { unimp("pthread_condattr_getpshared"); }
+ //void pthread_condattr_init ( void )  { unimp("pthread_condattr_init"); }
+-void pthread_condattr_setpshared ( void )  { unimp("pthread_condattr_setpshared"); }
++//void pthread_condattr_setpshared ( void )  { unimp("pthread_condattr_setpshared"); }
+ //void pthread_detach ( void )  { unimp("pthread_detach"); }
+ //void pthread_equal ( void )  { unimp("pthread_equal"); }
+ //void pthread_exit ( void )  { unimp("pthread_exit"); }

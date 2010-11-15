@@ -1,0 +1,57 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Appends "Debian" to package version 
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-3.4.1.orig/configure valgrind-3.4.1/configure
+--- valgrind-3.4.1.orig/configure	2009-03-01 22:41:19.000000000 +0000
++++ valgrind-3.4.1/configure	2009-03-05 15:18:18.000000000 +0000
+@@ -269,9 +269,9 @@
+ # Identity of this package.
+ PACKAGE_NAME='Valgrind'
+ PACKAGE_TARNAME='valgrind'
+-PACKAGE_VERSION='3.4.1'
+-PACKAGE_STRING='Valgrind 3.4.1'
+-PACKAGE_BUGREPORT='valgrind-users@lists.sourceforge.net'
++PACKAGE_VERSION='3.4.1-Debian'
++PACKAGE_STRING='Valgrind 3.4.1 Debian'
++PACKAGE_BUGREPORT='valgrind-users@lists.sourceforge.net | valgrind@packages.debian.org'
+ 
+ ac_unique_file="coregrind/m_main.c"
+ # Factoring default headers for most tests.
+@@ -1661,7 +1661,7 @@
+ 
+ # Define the identity of the package.
+  PACKAGE='valgrind'
+- VERSION='3.4.1'
++ VERSION='3.4.1-Debian'
+ 
+ 
+ cat >>confdefs.h <<_ACEOF
+@@ -4648,7 +4648,7 @@
+ 
+ # This variable will collect the individual suppression files
+ # depending on the results of autoconf
+-DEFAULT_SUPP=""
++DEFAULT_SUPP="debian.supp"
+ 
+ 
+ 

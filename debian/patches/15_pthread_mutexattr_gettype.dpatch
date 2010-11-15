@@ -1,0 +1,57 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Implements pthread_mutexattr_gettype(). 
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-2.2.0.orig/coregrind/vg_libpthread.c valgrind-2.2.0/coregrind/vg_libpthread.c
+--- valgrind-2.2.0.orig/coregrind/vg_libpthread.c	2004-08-29 21:02:27.000000000 +0000
++++ valgrind-2.2.0/coregrind/vg_libpthread.c	2004-10-13 18:55:33.000000000 +0000
+@@ -1276,6 +1276,16 @@
+    }
+ }
+ 
++int __pthread_mutexattr_gettype(const pthread_mutexattr_t *attr, int *type)
++{
++   vg_pthread_mutexattr_t* vg_attr;
++   CONVERT(mutexattr, attr, vg_attr);
++
++   *type = vg_attr->__vg_mutexkind;
++
++   return 0;
++}
++
+ int __pthread_mutexattr_destroy(pthread_mutexattr_t *attr)
+ {
+    return 0;
+diff -urN valgrind-2.2.0.orig/coregrind/vg_libpthread_unimp.c valgrind-2.2.0/coregrind/vg_libpthread_unimp.c
+--- valgrind-2.2.0.orig/coregrind/vg_libpthread_unimp.c	2004-08-29 21:02:27.000000000 +0000
++++ valgrind-2.2.0/coregrind/vg_libpthread_unimp.c	2004-10-13 18:56:00.000000000 +0000
+@@ -225,8 +225,8 @@
+                       { vgPlain_unimp("pthread_mutexattr_getkind_np"); }
+ __attribute__((weak)) void pthread_mutexattr_getpshared ( void )
+                       { vgPlain_unimp("pthread_mutexattr_getpshared"); }
+-__attribute__((weak)) void pthread_mutexattr_gettype ( void )
+-                      { vgPlain_unimp("pthread_mutexattr_gettype"); }
++//__attribute__((weak)) void pthread_mutexattr_gettype ( void )
++//                      { vgPlain_unimp("pthread_mutexattr_gettype"); }
+ __attribute__((weak)) void pthread_mutexattr_setkind_np ( void )
+                       { vgPlain_unimp("pthread_mutexattr_setkind_np"); }
+ //__attribute__((weak)) void pthread_mutexattr_setpshared ( void )

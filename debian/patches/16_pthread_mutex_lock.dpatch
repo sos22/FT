@@ -1,0 +1,39 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Warns about a possible deadlock on thread.
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-2.2.0.orig/coregrind/vg_scheduler.c valgrind-2.2.0/coregrind/vg_scheduler.c
+--- valgrind-2.2.0.orig/coregrind/vg_scheduler.c	2004-08-29 21:02:28.000000000 +0000
++++ valgrind-2.2.0/coregrind/vg_scheduler.c	2004-10-14 13:24:26.000000000 +0000
+@@ -2170,8 +2170,11 @@
+          } else {
+             if (is_trylock)
+                SET_PTHREQ_RETVAL(tid, EBUSY);
+-            else
++            else {
++               VG_(record_pthread_error)( tid,
++                  "pthread_mutex_lock/trylock: operation would deadlock");
+                SET_PTHREQ_RETVAL(tid, EDEADLK);
++	    }
+             return;
+          }
+       } else {

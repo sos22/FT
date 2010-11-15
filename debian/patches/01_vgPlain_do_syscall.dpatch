@@ -1,0 +1,92 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Added patch that lets GDB backtrace through vgPlain_do_syscall.
+## DP: Bug#225475
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-2.2.0+2.4.0rc1.orig/coregrind/x86-linux/syscall.S valgrind-2.2.0+2.4.0rc1/coregrind/x86-linux/syscall.S
+--- valgrind-2.2.0+2.4.0rc1.orig/coregrind/x86-linux/syscall.S	2005-02-01 22:53:21.000000000 +0000
++++ valgrind-2.2.0+2.4.0rc1/coregrind/x86-linux/syscall.S	2005-03-09 17:26:33.000000000 +0000
+@@ -46,10 +46,30 @@
+ 	spill values.)
+  */
+ VG_(do_syscall):
+-	push	%esi
+-	push	%edi
+-	push	%ebx
+-	push	%ebp
++#ifdef HAVE_GAS_CFI
++        .cfi_startproc
++        .cfi_def_cfa %esp, 4
++#endif
++        push    %esi
++#ifdef HAVE_GAS_CFI
++        .cfi_adjust_cfa_offset 4
++        .cfi_rel_offset %esi, 0
++#endif
++        push    %edi
++#ifdef HAVE_GAS_CFI
++        .cfi_adjust_cfa_offset 4
++        .cfi_rel_offset %edi, 0
++#endif
++        push    %ebx
++#ifdef HAVE_GAS_CFI
++        .cfi_adjust_cfa_offset 4
++        .cfi_rel_offset %ebx, 0
++#endif
++        push    %ebp
++#ifdef HAVE_GAS_CFI
++        .cfi_adjust_cfa_offset 4
++        .cfi_rel_offset %ebp, 0
++#endif
+ 	movl	16+ 4(%esp),%eax
+ 	movl	16+ 8(%esp),%ebx
+ 	movl	16+12(%esp),%ecx
+@@ -59,10 +79,25 @@
+ 	movl	16+28(%esp),%ebp
+ 	int	$0x80
+ 	popl	%ebp
+-	popl	%ebx
+-	popl	%edi
+-	popl	%esi
+-	ret
++#ifdef HAVE_GAS_CFI
++       .cfi_adjust_cfa_offset -4
++#endif
++        popl    %ebx
++#ifdef HAVE_GAS_CFI
++       .cfi_adjust_cfa_offset -4
++#endif
++        popl    %edi
++#ifdef HAVE_GAS_CFI
++       .cfi_adjust_cfa_offset -4
++#endif
++        popl    %esi
++#ifdef HAVE_GAS_CFI
++       .cfi_adjust_cfa_offset -4
++#endif
++        ret
++#ifdef HAVE_GAS_CFI
++       .cfi_endproc
++#endif
+ 
+ /*
+ 	Perform a clone system call.  clone is strange because it has

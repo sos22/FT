@@ -1,0 +1,33 @@
+Source: valgrind
+Section: devel
+Priority: optional
+Maintainer: Ubuntu MOTU Developers <ubuntu-motu@lists.ubuntu.com>
+XSBC-Original-Maintainer: Andrés Roldán <aroldan@debian.org>
+Uploaders: Juan Alvarez <jalvarez@fluidsignal.com>, Luis Bustamante <luferbu@fluidsignal.com>
+Build-Depends: debhelper (>> 3.0.0), libc6-dev (>> 2.3.0), autotools-dev, dpatch (>> 2.0.0), gdb, gcc-multilib [amd64] | gcc-4.1 (<< 4.1.2) [amd64]
+Standards-Version: 3.7.3.0
+
+Package: valgrind
+Architecture: i386 amd64 powerpc lpia
+Depends: ${shlibs:Depends}
+Conflicts: valgrind-callgrind
+Provides: valgrind-callgrind
+Suggests: libc6-dbg, kcachegrind, alleyoop
+Recommends: gdb
+Description: A memory debugger and profiler
+ Valgrind is a GPL'd tool to help you find memory-management problems in your
+ programs. When a program is run under Valgrind's supervision, all reads and
+ writes of memory are checked, and calls to malloc/new/free/delete are
+ intercepted. 
+ .
+ Valgrind can debug more or less any dynamically-linked ELF x86/Linux, 
+ amd64/Linux and ppc/Linux executables, without modification, recompilation, 
+ or anything.
+ .
+ Valgrind provides a generic infrastructure for supervising the execution of
+ programs called "tools". This is done by providing a way to instrument 
+ programs in very precise ways, making it relatively easy to support 
+ activities such as dynamic error detection and profiling. The Valgrind 
+ distribution currently includes three tools: a memory error detectors, a 
+ cache (time) profiler and a heap (space) profiler.
+ 

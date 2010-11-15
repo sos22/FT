@@ -1,0 +1,47 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Adds support for readdir syscall. Bug#237996 
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-2.2.0.orig/coregrind/vg_syscalls.c valgrind-2.2.0/coregrind/vg_syscalls.c
+--- valgrind-2.2.0.orig/coregrind/vg_syscalls.c	2004-08-31 00:08:37.000000000 +0000
++++ valgrind-2.2.0/coregrind/vg_syscalls.c	2004-09-01 23:40:53.000000000 +0000
+@@ -2148,6 +2148,20 @@
+       VG_TRACK( post_mem_write, arg2, res );
+ }
+ 
++PRE(readdir)
++{
++   /* int readdir(unsigned int fd, struct dirent *dirp,
++      unsigned int count); */
++   MAYBE_PRINTF("readdir ( %d, %p, %d )\n", arg1,arg2,arg3);
++   SYSCALL_TRACK( pre_mem_write, tid, "readdir(dirp)", arg2, arg3 );
++}
++
++POST(readdir)
++{
++   if (res > 0)
++      VG_TRACK( post_mem_write, arg2, sizeof(struct vki_dirent) );
++}
++
+ PRE(getgroups)
+ {
+    /* int getgroups(int size, gid_t list[]); */

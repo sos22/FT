@@ -1,0 +1,36 @@
+valgrind for Debian
+-------------------
+
+Valgrind is currently compiled under kernel 2.4 and hence the NPTL 
+support is disabled. In fact, this valgrind source compiles on kernel 2.6
+because a patch I've made and will work fine for most of the programs. 
+
+Valgrind does not currently support NPTL yet just as one expect. This may 
+lead to some "Assertion failure" messages mostly on TLS and generally 
+thread-based programs.
+
+The new --watchpoint flag for the memcheck tool (former called skin) is
+easy to use. 
+
+From the watchpoint upstream patch:
+
+(...)
+
+  You can also set watchpoints on the command line using --watchpoint=WP,... 
+  WP is of the form X, X-Y or X+Y for a single address, an address range 
+  or an address and length, respectively. X and Y can be decimal or 
+  hexadecimal numbers. Hexadecimal numbers are prefixed with 0x. You can 
+  specify the --watchpoint option as many times as you want. 
+  
+  Watchpoints are triggered when memory within the address range is read 
+  or written to, when memory is allocated or freed on top of the address 
+  range or when the address range goes into or out of scope on the stack.
+  
+  When a watchpoint is triggered, the stack backtrace from the triggering 
+  location is printed out, along with a count of the number of times the 
+  watchpoint has been triggered.
+
+(...)
+			    
+
+  -- Andrés Roldán <aroldan@debian.org>  Tue, 10 Feb 2004 18:43:25 +0000

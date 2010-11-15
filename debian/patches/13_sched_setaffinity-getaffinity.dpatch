@@ -1,0 +1,69 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Adds support for sched_setaffinity and sched_getaffinity syscalls. 
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-2.2.0.orig/coregrind/vg_syscalls.c valgrind-2.2.0/coregrind/vg_syscalls.c
+--- valgrind-2.2.0.orig/coregrind/vg_syscalls.c	2004-09-10 21:34:03.000000000 +0000
++++ valgrind-2.2.0/coregrind/vg_syscalls.c	2004-09-10 21:35:49.000000000 +0000
+@@ -5364,6 +5364,33 @@
+    }
+ }
+ 
++ PRE(sched_setaffinity)
++ {
++   /* int sched_setaffinity(pid_t pid, unsigned int len, unsigned long *mask) */
++   MAYBE_PRINTF("sched_setaffinity ( %d, %d, %p )\n", arg1, arg2, arg3);
++   if (arg2>0 && arg3 != (UInt)NULL) {
++     SYSCALL_TRACK(pre_mem_read, tid, "sched_setaffinity(mask)", arg3,
++                 arg2);
++   }
++ }
++
++ PRE(sched_getaffinity)
++ {
++   /* int sched_setaffinity(pid_t pid, unsigned int len, unsigned long *mask) */
++   MAYBE_PRINTF("sched_getaffinity ( %d, %d, %p )\n", arg1, arg2, arg3);
++   if (arg2>0) {
++     SYSCALL_TRACK(pre_mem_write, tid, "sched_getaffinity(mask)", arg3,
++                 arg2);
++   }
++ }
++
++ POST(sched_getaffinity)
++ {
++   if (arg2 > 0 && res > 0) {
++     VG_TRACK(post_mem_write, arg3, arg2);
++   }
++ }
++
+ PRE(acct)
+ {
+    /* int acct(const char *filename); */
+@@ -6110,6 +6137,8 @@
+    SYSBA(adjtimex,		0),
+    SYSBA(mmap2,			0),
+    SYSBA(futex,                 MayBlock),
++   SYSB_(sched_setaffinity,     0),
++   SYSBA(sched_getaffinity,     0),
+    SYSB_(acct,                  0),
+ 
+    /* new signal handling makes these normal blocking syscalls */

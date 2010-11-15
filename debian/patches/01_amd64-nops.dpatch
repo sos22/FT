@@ -1,0 +1,35 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Handles new NOPs opcodes 
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-3.2.3.orig/VEX/priv/guest-amd64/toIR.c valgrind-3.2.3/VEX/priv/guest-amd64/toIR.c
+--- valgrind-3.2.3.orig/VEX/priv/guest-amd64/toIR.c	2007-01-12 23:19:52.000000000 +0000
++++ valgrind-3.2.3/VEX/priv/guest-amd64/toIR.c	2007-08-23 21:57:47.000000000 +0000
+@@ -8334,7 +8334,7 @@
+       as many invalid combinations as possible. */
+    n_prefixes = 0;
+    while (True) {
+-      if (n_prefixes > 5) goto decode_failure;
++      if (n_prefixes > 7) goto decode_failure;
+       pre = getUChar(delta);
+       switch (pre) {
+          case 0x66: pfx |= PFX_66; break;

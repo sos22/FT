@@ -1,0 +1,9 @@
+01_manpage
+01_pcm-ioctl
+#01_suppression-strip
+#01_amd64-nops
+#01_valgrindrc
+#01_valgrind.pc
+02_version
+91_build_with_fno_stack_protector
+

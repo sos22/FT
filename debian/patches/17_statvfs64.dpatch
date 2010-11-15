@@ -1,0 +1,75 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Fixed the statfs64 wrapper to look at the right argument for the
+## DP: stat buffer and added an fstatfs64 wrapper.
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-2.2.0.orig/coregrind/vg_syscalls.c valgrind-2.2.0/coregrind/vg_syscalls.c
+--- valgrind-2.2.0.orig/coregrind/vg_syscalls.c	2004-10-13 18:40:41.000000000 +0000
++++ valgrind-2.2.0/coregrind/vg_syscalls.c	2004-10-14 13:34:10.000000000 +0000
+@@ -1637,6 +1637,18 @@
+    VG_TRACK( post_mem_write, arg2, sizeof(struct vki_statfs) );
+ }
+ 
++PRE(fstatfs64)
++{
++   /* int fstatfs64(int fd, size_t sz, struct statfs *buf); */
++   MAYBE_PRINTF("fstatfs64 ( %d, %p )\n",arg1,arg2);
++   SYSCALL_TRACK( pre_mem_write, tid, "stat(buf)", arg3, arg2 );
++}
++
++POST(fstatfs64)
++{
++   VG_TRACK( post_mem_write, arg3, arg2 );
++}
++
+ PRE(getsid)
+ {
+    /* pid_t getsid(pid_t pid); */
+@@ -5161,16 +5173,15 @@
+ 
+ PRE(statfs64)
+ {
+-   /* int statfs64(const char *path, struct statfs64 *buf); */
++   /* int statfs64(const char *path, size_t sz, struct statfs64 *buf); */
+    MAYBE_PRINTF("statfs64 ( %p, %p )\n",arg1,arg2);
+    SYSCALL_TRACK( pre_mem_read_asciiz, tid, "statfs64(path)", arg1 );
+-   SYSCALL_TRACK( pre_mem_write, tid, "statfs64(buf)", 
+-		  arg2, sizeof(struct vki_statfs64) );
++   SYSCALL_TRACK( pre_mem_write, tid, "statfs64(buf)", arg3, arg2 );
+ }
+ 
+ POST(statfs64)
+-{
+-   VG_TRACK( post_mem_write, arg2, sizeof(struct vki_statfs64) );
++{ 
++   VG_TRACK( post_mem_write, arg3, arg2 );
+ }
+ 
+ PRE(symlink)
+@@ -6081,6 +6092,7 @@
+    SYSB_(pwrite64,		MayBlock),
+    SYSB_(sync,			MayBlock),
+    SYSBA(fstatfs,		0),
++   SYSBA(fstatfs64,             0),
+    SYSB_(getsid,		0),
+    SYSBA(pread64,		MayBlock),
+    SYSB_(mknod,			0),

@@ -1,0 +1,98 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Adds PCM ioctls 
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-3.3.0.orig/coregrind/m_syswrap/syswrap-generic.c valgrind-3.3.0/coregrind/m_syswrap/syswrap-generic.c
+--- valgrind-3.3.0.orig/coregrind/m_syswrap/syswrap-generic.c	2007-12-10 23:18:43.000000000 +0000
++++ valgrind-3.3.0/coregrind/m_syswrap/syswrap-generic.c	2007-12-12 17:19:02.000000000 +0000
+@@ -3514,6 +3514,7 @@
+    case VKI_SNDCTL_SEQ_NRSYNTHS:
+    case VKI_SNDCTL_SEQ_NRMIDIS:
+    case VKI_SNDCTL_SEQ_GETTIME:
++   case VKI_SNDCTL_DSP_GETBLKSIZE:
+    case VKI_SNDCTL_DSP_GETFMTS:
+    case VKI_SNDCTL_DSP_GETTRIGGER:
+    case VKI_SNDCTL_DSP_GETODELAY:
+@@ -3522,9 +3523,6 @@
+    case VKI_SOUND_PCM_READ_RATE:
+    case VKI_SOUND_PCM_READ_CHANNELS:
+    case VKI_SOUND_PCM_READ_BITS:
+-#if !defined(VGA_ppc32) && !defined(VGA_ppc64)
+-   case (VKI_SOUND_PCM_READ_BITS|0x40000000): /* what the fuck ? */
+-#endif
+    case VKI_SOUND_PCM_READ_FILTER:
+       PRE_MEM_WRITE( "ioctl(SNDCTL_XXX|SOUND_XXX (SIOR, int))", 
+ 		     ARG3, sizeof(int));
+@@ -3532,11 +3530,11 @@
+    case VKI_SNDCTL_SEQ_CTRLRATE:
+    case VKI_SNDCTL_DSP_SPEED:
+    case VKI_SNDCTL_DSP_STEREO:
+-   case VKI_SNDCTL_DSP_GETBLKSIZE: 
+    case VKI_SNDCTL_DSP_CHANNELS:
+    case VKI_SOUND_PCM_WRITE_FILTER:
+    case VKI_SNDCTL_DSP_SUBDIVIDE:
+    case VKI_SNDCTL_DSP_SETFRAGMENT:
++   case VKI_SNDCTL_DSP_SETFMT:
+    case VKI_SNDCTL_DSP_GETCHANNELMASK:
+    case VKI_SNDCTL_DSP_BIND_CHANNEL:
+    case VKI_SNDCTL_TMR_TIMEBASE:
+@@ -4406,6 +4404,7 @@
+    case VKI_SNDCTL_SEQ_NRSYNTHS:
+    case VKI_SNDCTL_SEQ_NRMIDIS:
+    case VKI_SNDCTL_SEQ_GETTIME:
++   case VKI_SNDCTL_DSP_GETBLKSIZE:
+    case VKI_SNDCTL_DSP_GETFMTS:
+    case VKI_SNDCTL_DSP_GETTRIGGER:
+    case VKI_SNDCTL_DSP_GETODELAY:
+@@ -4414,20 +4413,17 @@
+    case VKI_SOUND_PCM_READ_RATE:
+    case VKI_SOUND_PCM_READ_CHANNELS:
+    case VKI_SOUND_PCM_READ_BITS:
+-#if !defined(VGA_ppc32) && !defined(VGA_ppc64)
+-   case (VKI_SOUND_PCM_READ_BITS|0x40000000): /* what the fuck ? */
+-#endif
+    case VKI_SOUND_PCM_READ_FILTER:
+       POST_MEM_WRITE(ARG3, sizeof(int));
+       break;
+    case VKI_SNDCTL_SEQ_CTRLRATE:
+    case VKI_SNDCTL_DSP_SPEED:
+    case VKI_SNDCTL_DSP_STEREO:
+-   case VKI_SNDCTL_DSP_GETBLKSIZE: 
+    case VKI_SNDCTL_DSP_CHANNELS:
+    case VKI_SOUND_PCM_WRITE_FILTER:
+    case VKI_SNDCTL_DSP_SUBDIVIDE:
+    case VKI_SNDCTL_DSP_SETFRAGMENT:
++   case VKI_SNDCTL_DSP_SETFMT:
+    case VKI_SNDCTL_DSP_GETCHANNELMASK:
+    case VKI_SNDCTL_DSP_BIND_CHANNEL:
+    case VKI_SNDCTL_TMR_TIMEBASE:
+diff -urN valgrind-3.3.0.orig/include/vki/vki-linux.h valgrind-3.3.0/include/vki/vki-linux.h
+--- valgrind-3.3.0.orig/include/vki/vki-linux.h	2007-12-10 23:18:25.000000000 +0000
++++ valgrind-3.3.0/include/vki/vki-linux.h	2007-12-12 17:19:47.000000000 +0000
+@@ -1840,6 +1840,7 @@
+ #define VKI_SNDCTL_DSP_SETFRAGMENT	_VKI_SIOWR('P',10, int)
+ 
+ #define VKI_SNDCTL_DSP_GETFMTS		_VKI_SIOR ('P',11, int) /* Returns a mask */
++#define VKI_SNDCTL_DSP_SETFMT           _VKI_SIOWR('P', 5, int) /* Selects ONE fmt */
+ 
+ typedef struct vki_audio_buf_info {
+ 			int fragments;	/* # of available fragments (partially usend ones not counted) */

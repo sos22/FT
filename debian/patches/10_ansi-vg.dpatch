@@ -1,0 +1,35 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Make the valgrind.h file (almost) ANSI compliant.
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-2.2.0+2.4.0rc1.orig/include/valgrind.h valgrind-2.2.0+2.4.0rc1/include/valgrind.h
+--- valgrind-2.2.0+2.4.0rc1.orig/include/valgrind.h	2005-03-08 19:30:36.000000000 +0000
++++ valgrind-2.2.0+2.4.0rc1/include/valgrind.h	2005-03-09 19:11:29.000000000 +0000
+@@ -119,7 +119,7 @@
+     _zzq_args[2] = (unsigned int)(_zzq_arg2);			\
+     _zzq_args[3] = (unsigned int)(_zzq_arg3);			\
+     _zzq_args[4] = (unsigned int)(_zzq_arg4);			\
+-    asm volatile("roll $29, %%eax ; roll $3, %%eax\n\t"		\
++    __asm__ volatile("roll $29, %%eax ; roll $3, %%eax\n\t"		\
+                  "rorl $27, %%eax ; rorl $5, %%eax\n\t"		\
+                  "roll $13, %%eax ; roll $19, %%eax"		\
+                  : "=d" (_zzq_rlval)				\

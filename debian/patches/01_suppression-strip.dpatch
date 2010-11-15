@@ -1,0 +1,45 @@
+#! /bin/sh -e
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Strips ubuntu suppression already included on Debian package 
+
+[ -f debian/patches/00patch-opts ] && . debian/patches/00patch-opts
+patch_opts="${patch_opts:--f --no-backup-if-mismatch}"
+
+if [ $# -ne 1 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+       -patch) patch $patch_opts -p1 < $0;;
+       -unpatch) patch $patch_opts -p1 -R < $0;;
+        *)
+                echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+                exit 1;;
+esac
+
+exit 0
+@DPATCH@
+
+diff -urN valgrind-3.2.3.orig/glibc-2.3.supp valgrind-3.2.3/glibc-2.3.supp
+--- valgrind-3.2.3.orig/glibc-2.3.supp	2007-01-07 05:39:15.000000000 +0000
++++ valgrind-3.2.3/glibc-2.3.supp	2007-02-01 19:40:36.392187814 +0000
+@@ -577,18 +577,6 @@
+    obj:/lib/ld-2.3.2.so
+ }
+ 
+-##----------------------------------------------------------------------##
+-## Ubuntu something (based on Debian 3.0?) on x86
+-
+-{
+-   Ubuntu-stripped-ld.so
+-   Memcheck:Cond
+-   obj:/lib/ld-2.3.*.so
+-   obj:/lib/ld-2.3.*.so
+-   obj:/lib/ld-2.3.*.so
+-   obj:/lib/ld-2.3.*.so
+-   obj:/lib/ld-2.3.*.so
+-}
+ 
+ ##----------------------------------------------------------------------##
+ # MontaVista Linux 4.0.1 on ppc32
