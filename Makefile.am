@@ -9,6 +9,7 @@ TOOLS =		memcheck \
 		massif \
 		lackey \
 		none \
+		ft \
 		helgrind \
 		drd
 
