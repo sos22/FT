@@ -3,6 +3,8 @@
 #include "pub_tool_tooliface.h"
 #include "pub_tool_replacemalloc.h"
 #include "pub_tool_libcbase.h"
+#include "pub_tool_libcprint.h"
+#include "pub_tool_stacktrace.h"
 
 static void nl_post_clo_init(void)
 {
@@ -25,7 +27,16 @@ static void nl_fini(Int exitcode)
 static void *
 my_malloc(ThreadId tid, SizeT n)
 {
-	VG_(printf)("my_malloc %d\n", n);
+	StackTrace stack[2];
+	UInt nr;
+	UInt r;
+
+	VG_(printf)("malloc %lx: ", n);
+	nr = VG_(get_StackTrace)(tid, stack, sizeof(stack)/sizeof(stack[0]),
+				 NULL, NULL, 0);
+	for (r = 0; r < nr; r++)
+		VG_(printf)("%llx ", stack[r]);
+	VG_(printf)("\n");
 	return VG_(cli_malloc)(8, n);
 }
 
