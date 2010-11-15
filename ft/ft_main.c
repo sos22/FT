@@ -1,35 +1,8 @@
-
-/*--------------------------------------------------------------------*/
-/*--- Nulgrind: The null tool.                           nl_main.c ---*/
-/*--------------------------------------------------------------------*/
-
-/*
-   This file is part of Nulgrind, the simplest possible Valgrind tool,
-   which does nothing.
-
-   Copyright (C) 2002-2008 Nicholas Nethercote
-      njn@valgrind.org
-
-   This program is free software; you can redistribute it and/or
-   modify it under the terms of the GNU General Public License as
-   published by the Free Software Foundation; either version 2 of the
-   License, or (at your option) any later version.
-
-   This program is distributed in the hope that it will be useful, but
-   WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-   General Public License for more details.
-
-   You should have received a copy of the GNU General Public License
-   along with this program; if not, write to the Free Software
-   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
-   02111-1307, USA.
-
-   The GNU General Public License is contained in the file COPYING.
-*/
-
+/* Based on nullgrind */
 #include "pub_tool_basics.h"
 #include "pub_tool_tooliface.h"
+#include "pub_tool_replacemalloc.h"
+#include "pub_tool_libcbase.h"
 
 static void nl_post_clo_init(void)
 {
@@ -49,24 +22,62 @@ static void nl_fini(Int exitcode)
 {
 }
 
+static void *
+my_malloc(ThreadId tid, SizeT n)
+{
+	VG_(printf)("my_malloc %d\n", n);
+	return VG_(cli_malloc)(8, n);
+}
+
+static void
+my_free(ThreadId tid, void *p)
+{
+	VG_(cli_free)(p);
+}
+
+static void *
+my_memalign(ThreadId tid, SizeT align, SizeT n)
+{
+	return VG_(cli_malloc)(align, n);
+}
+
+static void *
+my_calloc(ThreadId tid, SizeT nmemb, SizeT size1)
+{
+	void *buf = VG_(cli_malloc)(8, nmemb * size1);
+	VG_(memset)(buf, 0, nmemb * size1);
+	return buf;
+}
+
+static void *
+my_realloc(ThreadId tid, void *p, SizeT new_size)
+{
+	return VG_(cli_realloc)(p, new_size);
+}
+
 static void nl_pre_clo_init(void)
 {
-   VG_(details_name)            ("Nulgrind");
+   VG_(details_name)            ("Findtypes");
    VG_(details_version)         (NULL);
-   VG_(details_description)     ("a binary JIT-compiler");
-   VG_(details_copyright_author)(
-      "Copyright (C) 2002-2008, and GNU GPL'd, by Nicholas Nethercote.");
-   VG_(details_bug_reports_to)  (VG_BUGS_TO);
+   VG_(details_description)     ("foo");
+   VG_(details_copyright_author)("bar");
+   VG_(details_bug_reports_to)  ("bazz");
 
    VG_(basic_tool_funcs)        (nl_post_clo_init,
                                  nl_instrument,
                                  nl_fini);
 
-   /* No needs, no core events to track */
+   VG_(printf)("Wibble.\n");
+   VG_(needs_malloc_replacement)(my_malloc,
+				 my_malloc,
+				 my_malloc,
+				 my_memalign,
+				 my_calloc,
+				 my_free,
+				 my_free,
+				 my_free,
+				 my_realloc,
+				 0);
 }
 
 VG_DETERMINE_INTERFACE_VERSION(nl_pre_clo_init)
-
-/*--------------------------------------------------------------------*/
-/*--- end                                                          ---*/
-/*--------------------------------------------------------------------*/

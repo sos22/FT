@@ -40,6 +40,7 @@
  * alloc/freeing. */
 extern void* VG_(cli_malloc) ( SizeT align, SizeT nbytes );
 extern void  VG_(cli_free)   ( void* p );
+extern void* VG_(cli_realloc)(void *p, SizeT sz);
 
 /* If a tool uses deferred freeing (e.g. memcheck to catch accesses to
    freed memory) it can maintain number and total size of queued blocks

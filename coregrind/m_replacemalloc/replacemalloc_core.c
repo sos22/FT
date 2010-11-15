@@ -110,6 +110,12 @@ void VG_(cli_free) ( void* p )
    VG_(arena_free) ( VG_AR_CLIENT, p );                          
 }
 
+void *VG_(cli_realloc) ( void *p, SizeT sz )
+{
+   return VG_(arena_realloc) ( VG_AR_CLIENT, "replacemalloc.cm.3",
+			       p, sz );
+}
+
 Bool VG_(addr_is_in_block)( Addr a, Addr start, SizeT size, SizeT rz_szB )
 {
    return ( start - rz_szB <= a  &&  a < start + size + rz_szB );
