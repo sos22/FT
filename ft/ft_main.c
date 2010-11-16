@@ -144,14 +144,182 @@ static void nl_post_clo_init(void)
 {
 }
 
-static
-IRSB* nl_instrument ( VgCallbackClosure* closure,
-                      IRSB* bb,
-                      VexGuestLayout* layout, 
-                      VexGuestExtents* vge,
-                      IRType gWordTy, IRType hWordTy )
+static IRTemp
+cast_to_U64(IRSB *irsb, IRExpr *expr)
 {
-	return bb;
+	IROp op;
+	IRTemp tmp;
+
+	switch (typeOfIRExpr(irsb->tyenv, expr)) {
+	case Ity_I8:
+		op = Iop_8Uto64;
+		break;
+	case Ity_I16:
+		op = Iop_16Uto64;
+		break;
+	case Ity_I32:
+		op = Iop_32Uto64;
+		break;
+	case Ity_F64:
+		op = Iop_ReinterpF64asI64;
+		break;
+	case Ity_F32:
+		tmp = newIRTemp(irsb->tyenv, Ity_I32);
+		addStmtToIRSB(irsb,
+			      IRStmt_WrTmp(tmp,
+					   IRExpr_Unop(Iop_ReinterpF32asI32,
+						       expr)));
+		return cast_to_U64(irsb,
+				   IRExpr_RdTmp(tmp));
+	default:
+		VG_(tool_panic)((Char *)"Weird-arse type problem.\n");
+	}
+	tmp = newIRTemp(irsb->tyenv, Ity_I64);
+	addStmtToIRSB(irsb,
+		      IRStmt_WrTmp(tmp,
+				   IRExpr_Unop(op, expr)));
+	return tmp;
+}
+
+static void
+add_dirty_call(IRSB *irsb,
+	       char *name,
+	       void *ptr,
+	       ...)
+{
+	va_list args;
+	int nr_args;
+	IRExpr *e;
+	IRExpr **arg_v;
+	IRDirty *dirty;
+
+	va_start(args, ptr);
+	nr_args = 0;
+	while (1) {
+		e = va_arg(args, IRExpr *);
+		if (!e)
+			break;
+		nr_args++;
+	}
+	va_end(args);
+
+	arg_v = LibVEX_Alloc( (nr_args + 1) * sizeof(arg_v[0]) );
+	va_start(args, ptr);
+	nr_args = 0;
+	while (1) {
+		e = va_arg(args, IRExpr *);
+		if (!e)
+			break;
+		arg_v[nr_args] = e;
+		nr_args++;
+	}
+	arg_v[nr_args] = NULL;
+	va_end(args);
+
+	dirty = unsafeIRDirty_0_N(0, name, ptr, arg_v);
+	addStmtToIRSB(irsb, IRStmt_Dirty(dirty) );
+}
+
+static void
+do_store(unsigned long addr, unsigned long data, unsigned long size)
+{
+	VG_(memcpy)( (void *)addr, &data, size);
+}
+
+static void
+do_store2(unsigned long addr, unsigned long x1, unsigned long x2)
+{
+	((unsigned long *)addr)[0] = x1;
+	((unsigned long *)addr)[1] = x2;
+}
+
+static void
+constructLoggingStore(IRSB *irsb,
+		      IRExpr *addr,
+		      IRExpr *data)
+{
+	IRType t = typeOfIRExpr(irsb->tyenv, data);
+	IRTemp tmp1, tmp2;
+	int is_vector = 0;
+
+	switch (t) {
+	case Ity_I8:
+	case Ity_I16:
+	case Ity_I32:
+	case Ity_F32:
+	case Ity_F64:
+		tmp1 = cast_to_U64(irsb, data);
+		add_dirty_call(irsb,
+			       "do_store",
+			       do_store,
+			       addr,
+			       IRExpr_RdTmp(tmp1),
+			       IRExpr_Const(IRConst_U64(sizeofIRType(t))),
+			       NULL);
+		break;
+	case Ity_I64:
+		add_dirty_call(irsb,
+			       "do_store",
+			       do_store,
+			       addr,
+			       data,
+			       IRExpr_Const(IRConst_U64(8)),
+			       NULL);
+		break;
+	case Ity_V128:
+		is_vector = 1;
+	case Ity_I128:
+		tmp1 = newIRTemp(irsb->tyenv, Ity_I64);
+		tmp2 = newIRTemp(irsb->tyenv, Ity_I64);
+		addStmtToIRSB(
+			irsb,
+			IRStmt_WrTmp(
+				tmp1,
+				IRExpr_Unop(
+					is_vector ? Iop_V128to64 : Iop_128to64,
+					data)));
+		addStmtToIRSB(
+			irsb,
+			IRStmt_WrTmp(
+				tmp2,
+				IRExpr_Unop(
+					is_vector ? Iop_V128HIto64 : Iop_128HIto64,
+					data)));
+		add_dirty_call(irsb,
+			       "do_store2",
+			       do_store2,
+			       addr,
+			       IRExpr_RdTmp(tmp1),
+			       IRExpr_RdTmp(tmp2),
+			       NULL);
+		break;
+	default:
+		VG_(tool_panic)("Store of unexpected type\n");
+	}
+}
+
+static IRSB *
+ft_instrument(VgCallbackClosure* closure,
+	      IRSB* bb,
+	      VexGuestLayout* layout,
+	      VexGuestExtents* vge,
+	      IRType gWordTy,
+	      IRType hWordTy)
+{
+	IRSB *out = deepCopyIRSBExceptStmts(bb);
+	int x;
+	IRStmt *stmt;
+
+	for (x = 0; x < bb->stmts_used; x++) {
+		stmt = bb->stmts[x];
+		if (stmt->tag != Ist_Store) {
+			addStmtToIRSB(out, stmt);
+		} else {
+			constructLoggingStore(out, stmt->Ist.Store.addr,
+					      stmt->Ist.Store.data);
+		}
+	}
+	return out;
 }
 
 static void nl_fini(Int exitcode)
@@ -214,10 +382,9 @@ static void nl_pre_clo_init(void)
    VG_(details_bug_reports_to)  ("bazz");
 
    VG_(basic_tool_funcs)        (nl_post_clo_init,
-                                 nl_instrument,
+                                 ft_instrument,
                                  nl_fini);
 
-   VG_(printf)("Wibble.\n");
    VG_(needs_malloc_replacement)(my_malloc,
 				 my_malloc,
 				 my_malloc,
