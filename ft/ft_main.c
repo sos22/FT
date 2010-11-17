@@ -8,6 +8,7 @@
 #include "pub_tool_libcprint.h"
 #include "pub_tool_stacktrace.h"
 #include "pub_tool_threadstate.h"
+#include "pub_tool_debuginfo.h"
 
 #include "libvex_guest_offsets.h"
 
@@ -260,7 +261,7 @@ static int
 log_write_here(unsigned long addr, unsigned long rip)
 {
 	struct store_hash_entry *e;
-	unsigned long hash = addr;
+	unsigned long hash = rip;
 	struct type_tag tag;
 	int x;
 
@@ -336,6 +337,7 @@ log_write(unsigned long addr, unsigned long rsp)
 	}
 	/* This is bad: the stack is apparently too deep for us to do
 	   anything with.  Just ignore this store. */
+	VG_(printf)("Stack too deep?\n");
 }
 
 static void
@@ -459,19 +461,25 @@ ft_fini(Int exitcode)
 	int x;
 	int y;
 	struct store_hash_entry *e;
+	Char buf[1024];
 
 	for (x = 0; x < NR_STORE_HASH_HEADS; x++) {
 		for (e = store_hash_heads[x]; e; e = e->next) {
 			if (e->nr_tags == 0)
 				continue;
-			VG_(printf)("%016lx\t%016lx:%lx:%x\t",
-				    e->rip,
-				    e->tag1.allocation_rip,
+			VG_(describe_IP)(e->rip, buf, sizeof(buf));
+			VG_(printf)("%40s\t", buf);
+			VG_(describe_IP)(e->tag1.allocation_rip, buf, sizeof(buf));
+			VG_(printf)("(%s):%lx:%x\t",
+				    buf,
 				    e->tag1.allocation_size,
 				    e->tag1.offset);
 			for (y = 0; y < e->nr_tags - 1; y++) {
-				VG_(printf)("%016lx:%lx:%x\t",
-					    e->out_of_line_tags[y].allocation_rip,
+				VG_(describe_IP)(e->out_of_line_tags[y].allocation_rip,
+						 buf,
+						 sizeof(buf));
+				VG_(printf)("(%s):%lx:%x\t",
+					    buf,
 					    e->out_of_line_tags[y].allocation_size,
 					    e->out_of_line_tags[y].offset);
 			}
