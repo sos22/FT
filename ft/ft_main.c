@@ -1,16 +1,23 @@
 /* Based on nullgrind */
+#include <sys/types.h>
+#include <errno.h>
+
 #include "pub_tool_basics.h"
 #include "pub_tool_tooliface.h"
 #include "pub_tool_replacemalloc.h"
 #include "pub_tool_mallocfree.h"
+#include "pub_tool_vki.h"
 #include "pub_tool_libcbase.h"
 #include "pub_tool_libcassert.h"
 #include "pub_tool_libcprint.h"
+#include "pub_tool_libcfile.h"
 #include "pub_tool_stacktrace.h"
 #include "pub_tool_threadstate.h"
 #include "pub_tool_debuginfo.h"
 
 #include "libvex_guest_offsets.h"
+
+static const char *tag_table;
 
 struct type_tag {
 	unsigned long allocation_rip;
@@ -94,6 +101,15 @@ hash_ptr(const void *_ptr)
 	return ptr;
 }
 
+static unsigned long
+hash_store_addr(unsigned long rip)
+{
+	unsigned long hash = rip;
+	while (hash >= NR_STORE_HASH_HEADS)
+		hash = (hash / NR_STORE_HASH_HEADS) ^ (hash % NR_STORE_HASH_HEADS);
+	return hash;
+}
+
 static void
 clear_allocation_tag(void *p)
 {
@@ -148,8 +164,104 @@ register_allocation(void *ptr, SizeT sz, ThreadId tid)
 	}
 }
 
-static void nl_post_clo_init(void)
+struct read_file {
+	int fd;
+	unsigned buf_cons;
+	unsigned buf_prod;
+	unsigned char buf[128];
+};
+
+static int
+open_read_file(struct read_file *out, const Char *fname)
 {
+	SysRes sr;
+
+	sr = VG_(open)(tag_table, VKI_O_RDONLY, 0);
+	if (sr.isError)
+		return sr.err;
+	out->fd = sr.res;
+	out->buf_cons = 0;
+	out->buf_prod = 0;
+	return 0;
+}
+
+static int
+read_file(struct read_file *rf, void *buf, size_t sz)
+{
+	unsigned to_copy;
+	Int x;
+
+	if (sz == 0)
+		return 1;
+	while (1) {
+		to_copy = sz;
+		if (rf->buf_prod > rf->buf_cons) {
+			if (rf->buf_prod - rf->buf_cons < sz)
+				to_copy = rf->buf_prod - rf->buf_cons;
+			VG_(memcpy)(buf, rf->buf + rf->buf_cons, to_copy);
+			rf->buf_cons += to_copy;
+			sz -= to_copy;
+			buf = (void *)((unsigned long)buf + to_copy);
+			if (!sz)
+				return 1;
+		}
+		tl_assert(rf->buf_prod == rf->buf_cons);
+		rf->buf_cons = rf->buf_prod = 0;
+		x = VG_(read)(rf->fd, rf->buf + rf->buf_prod, sizeof(rf->buf) - rf->buf_prod);
+		if (x == 0)
+			return 0;
+		tl_assert(x > 0);
+		rf->buf_prod += x;
+	}
+}
+
+static void
+close_read_file(struct read_file *rf)
+{
+	VG_(close)(rf->fd);
+}
+
+struct table_site_header {
+	unsigned long rip;
+	unsigned nr_tags;
+};
+
+static void
+ft_post_clo_init(void)
+{
+	int err;
+	struct read_file rf;
+	struct table_site_header tsh;
+	struct store_hash_entry *e;
+	unsigned long hash;
+
+	err = open_read_file(&rf, tag_table);
+	if (err) {
+		if (err == ENOENT) {
+			/* Just use an empty table */
+			return;
+		}
+		VG_(tool_panic)("failed to open tag table");
+	}
+	while (1) {
+		if (!read_file(&rf, &tsh, sizeof(tsh)))
+			break; /* Assume we hit end-of-file */
+		e = VG_(malloc)("store_hash_entry", sizeof(*e));
+		e->rip = tsh.rip;
+		e->nr_tags = tsh.nr_tags;
+		if (e->nr_tags != 0)
+			read_file(&rf, &e->tag1, sizeof(e->tag1));
+		if (e->nr_tags > 1) {
+			e->out_of_line_tags = VG_(malloc)("out of line tag table",
+							  sizeof(e->out_of_line_tags[0]) * (e->nr_tags - 1));
+			read_file(&rf, e->out_of_line_tags,
+				  sizeof(e->out_of_line_tags[0]) * (e->nr_tags - 1));
+		}
+		hash = hash_store_addr(e->rip);
+		e->next = store_hash_heads[hash];
+		//store_hash_heads[hash] = e;
+	}
+	close_read_file(&rf);
 }
 
 static IRTemp
@@ -260,13 +372,11 @@ fetch_tag(unsigned long addr, struct type_tag *type)
 static int
 log_write_here(unsigned long addr, unsigned long rip)
 {
+	unsigned long hash = hash_store_addr(rip);
 	struct store_hash_entry *e;
-	unsigned long hash = rip;
 	struct type_tag tag;
 	int x;
 
-	while (hash >= NR_STORE_HASH_HEADS)
-		hash = (hash / NR_STORE_HASH_HEADS) ^ (hash % NR_STORE_HASH_HEADS);
 	e = store_hash_heads[hash];
 	while (e && e->rip != rip)
 		e = e->next;
@@ -454,38 +564,87 @@ ft_instrument(VgCallbackClosure* closure,
 	return out;
 }
 
+struct write_file {
+	int fd;
+	unsigned buf_prod;
+	unsigned char buf[1024];
+};
+
+static int
+open_write_file(struct write_file *out, const Char *fname)
+{
+	SysRes sr;
+
+	sr = VG_(open)(tag_table, VKI_O_WRONLY|VKI_O_CREAT|VKI_O_TRUNC, 0600);
+	if (sr.isError)
+		return sr.err;
+	out->fd = sr.res;
+	out->buf_prod = 0;
+	return 0;
+}
+
+static void
+write_file(struct write_file *wf, const void *buf, size_t sz)
+{
+	unsigned to_copy;
+	unsigned x;
+	int y;
+
+	while (sz != 0) {
+		if (wf->buf_prod == sizeof(wf->buf)) {
+			for (x = 0; x < wf->buf_prod; x += y) {
+				y = VG_(write)(wf->fd, wf->buf + x, wf->buf_prod - x);
+				tl_assert(y > 0);
+			}
+			wf->buf_prod = 0;
+		}
+
+		to_copy = sz;
+		if (wf->buf_prod + to_copy >= sizeof(wf->buf))
+			to_copy = sizeof(wf->buf) - wf->buf_prod;
+		VG_(memcpy)(wf->buf + wf->buf_prod, buf, to_copy);
+		wf->buf_prod += to_copy;
+		buf = (void *)((unsigned long)buf + to_copy);
+		sz -= to_copy;
+	}
+}
+
+static void
+close_write_file(struct write_file *wf)
+{
+	int x, y;
+	for (x = 0; x < wf->buf_prod; x++) {
+		y = VG_(write)(wf->fd, wf->buf + x, wf->buf_prod - x);
+		tl_assert(y > 0);
+	}
+	VG_(close)(wf->fd);
+}
+
 static void
 ft_fini(Int exitcode)
 {
 	/* Walk the store table and output the tag tables. */
+	struct write_file wf;
+	struct table_site_header tsh;
+	struct store_hash_entry *e;
 	int x;
 	int y;
-	struct store_hash_entry *e;
-	Char buf[1024];
 
+	x = open_write_file(&wf, tag_table);
+	if (x < 0)
+		VG_(tool_panic)("Opening output tag table\n");
 	for (x = 0; x < NR_STORE_HASH_HEADS; x++) {
 		for (e = store_hash_heads[x]; e; e = e->next) {
-			if (e->nr_tags == 0)
-				continue;
-			VG_(describe_IP)(e->rip, buf, sizeof(buf));
-			VG_(printf)("%40s\t", buf);
-			VG_(describe_IP)(e->tag1.allocation_rip, buf, sizeof(buf));
-			VG_(printf)("(%s):%lx:%x\t",
-				    buf,
-				    e->tag1.allocation_size,
-				    e->tag1.offset);
-			for (y = 0; y < e->nr_tags - 1; y++) {
-				VG_(describe_IP)(e->out_of_line_tags[y].allocation_rip,
-						 buf,
-						 sizeof(buf));
-				VG_(printf)("(%s):%lx:%x\t",
-					    buf,
-					    e->out_of_line_tags[y].allocation_size,
-					    e->out_of_line_tags[y].offset);
-			}
-			VG_(printf)("\n");
+			tsh.rip = e->rip;
+			tsh.nr_tags = e->nr_tags;
+			write_file(&wf, &tsh, sizeof(tsh));
+			if (tsh.nr_tags != 0)
+				write_file(&wf, &e->tag1, sizeof(e->tag1));
+			for (y = 0; y < e->nr_tags - 1; y++)
+				write_file(&wf, &e->out_of_line_tags[y], sizeof(e->out_of_line_tags[y]));
 		}
 	}
+	close_write_file(&wf);
 }
 
 static void
@@ -535,6 +694,18 @@ my_realloc(ThreadId tid, void *p, SizeT new_size)
 	return n;
 }
 
+static void
+ft_load(unsigned long addr, unsigned long size, Char *name)
+{
+	VG_(printf)("Load %s at %lx\n", name, addr);
+}
+
+static void
+ft_unload(unsigned long addr, unsigned long size, Char *name)
+{
+	VG_(printf)("Unload %s from %lx\n", name, addr);
+}
+
 static void nl_pre_clo_init(void)
 {
    VG_(details_name)            ("Findtypes");
@@ -543,10 +714,14 @@ static void nl_pre_clo_init(void)
    VG_(details_copyright_author)("bar");
    VG_(details_bug_reports_to)  ("bazz");
 
-   VG_(basic_tool_funcs)        (nl_post_clo_init,
+   /* XXX make this configurable. */
+   tag_table = "tag_table.dat";
+
+   VG_(basic_tool_funcs)        (ft_post_clo_init,
                                  ft_instrument,
                                  ft_fini);
 
+   VG_(needs_load_unload)(ft_load, ft_unload);
    VG_(needs_malloc_replacement)(my_malloc,
 				 my_malloc,
 				 my_malloc,
