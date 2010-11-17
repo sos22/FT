@@ -7,6 +7,9 @@
 #include "pub_tool_libcassert.h"
 #include "pub_tool_libcprint.h"
 #include "pub_tool_stacktrace.h"
+#include "pub_tool_threadstate.h"
+
+#include "libvex_guest_offsets.h"
 
 struct type_tag {
 	unsigned long allocation_rip;
@@ -51,9 +54,10 @@ address_hash_heads[NR_ADDR_HASH_ENTRIES];
    store with the same address, which makes some things a bit more
    convenient.
 */
+#define MAX_TAGS_PER_STORE 8
 struct store_hash_entry {
 	struct store_hash_entry *next;
-	unsigned long rips;
+	unsigned long rip;
 	struct type_tag tag1; /* The common case is that each store
 				 writes precisely one tag, so keep one
 				 tag inline. */
@@ -61,6 +65,9 @@ struct store_hash_entry {
 			level up the call stack. */
 	struct type_tag *out_of_line_tags;
 };
+#define NR_STORE_HASH_HEADS 4097
+static struct store_hash_entry *
+store_hash_heads[NR_STORE_HASH_HEADS];
 
 static void
 build_tag(struct type_tag *t, ThreadId tid, SizeT sz)
@@ -220,15 +227,130 @@ add_dirty_call(IRSB *irsb,
 	addStmtToIRSB(irsb, IRStmt_Dirty(dirty) );
 }
 
-static void
-do_store(unsigned long addr, unsigned long data, unsigned long size)
+static int
+tags_eq(const struct type_tag *a, const struct type_tag *b)
 {
+	return a->allocation_rip == b->allocation_rip &&
+		a->allocation_size == b->allocation_size &&
+		a->offset == b->offset;
+}
+
+static int
+fetch_tag(unsigned long addr, struct type_tag *type)
+{
+	unsigned long h = hash_ptr((void *)(addr - (addr % ADDR_REGION_SIZE)));
+	struct address_hash_entry **pprev, *e;
+	pprev = &address_hash_heads[h];
+	e = *pprev;
+	while (e && e->addr != addr) {
+		pprev = &e->next;
+		e = *pprev;
+	}
+	if (!e)
+		return 0;
+	*pprev = e->next;
+	e->next = address_hash_heads[h];
+	address_hash_heads[h] = e;
+	*type = e->tag;
+	type->offset += addr % ADDR_REGION_SIZE;
+	return 1;
+}
+
+static int
+log_write_here(unsigned long addr, unsigned long rip)
+{
+	struct store_hash_entry *e;
+	unsigned long hash = addr;
+	struct type_tag tag;
+	int x;
+
+	while (hash >= NR_STORE_HASH_HEADS)
+		hash = (hash / NR_STORE_HASH_HEADS) ^ (hash % NR_STORE_HASH_HEADS);
+	e = store_hash_heads[hash];
+	while (e && e->rip != rip)
+		e = e->next;
+	if (e && e->nr_tags == 0) {
+		/* This is a special entry which indicates that we
+		   should examine further up the call stack. */
+		return 0;
+	}
+	if (!fetch_tag(addr, &tag)) {
+		/* Not a malloc address */
+		return 1;
+	}
+	if (!e) {
+		/* First store issued by this instruction */
+		e = VG_(malloc)("store_hash_entry", sizeof(*e));
+		e->rip = rip;
+		e->nr_tags = 1;
+		e->tag1 = tag;
+		e->next = store_hash_heads[hash];
+		store_hash_heads[hash] = e;
+		return 1;
+	}
+
+	if (tags_eq(&e->tag1, &tag))
+		return 1;
+	for (x = 0; x < e->nr_tags - 1; x++)
+		if (tags_eq(&e->out_of_line_tags[x], &tag))
+			return 1;
+	if (e->nr_tags == MAX_TAGS_PER_STORE) {
+		/* Whoops.  This instruction appears to write to too
+		   many distinct types, so it's probably e.g. part of
+		   a memset or equivalent.  Use the enclosing function
+		   instead. */
+		e->nr_tags = 0;
+		return 0;
+	}
+
+	if (e->nr_tags == 1) {
+		e->out_of_line_tags = VG_(malloc)("out of line tags",
+						  sizeof(*e->out_of_line_tags));
+	} else {
+		e->out_of_line_tags = VG_(realloc)("out of line tags",
+						   e->out_of_line_tags,
+						   sizeof(*e->out_of_line_tags) *
+						   e->nr_tags);
+	}
+	e->out_of_line_tags[e->nr_tags-1] = tag;
+	e->nr_tags++;
+	return 1;
+}
+
+static void
+log_write(unsigned long addr, unsigned long rsp)
+{
+	Addr stack[8];
+	int n;
+	int r;
+
+	if (addr >= rsp - 128 && addr < rsp + 8192) {
+		/* Quickly drop accesses to the stack. */
+		return;
+	}
+
+	n = VG_(get_StackTrace)(VG_(get_running_tid)(), stack, 8, NULL, NULL, 0);
+	for (r = 0; r < n; r++) {
+		if (log_write_here(addr, stack[r]))
+			return;
+	}
+	/* This is bad: the stack is apparently too deep for us to do
+	   anything with.  Just ignore this store. */
+}
+
+static void
+do_store(unsigned long addr, unsigned long data, unsigned long size,
+	 unsigned long rsp)
+{
+	log_write(addr, rsp);
 	VG_(memcpy)( (void *)addr, &data, size);
 }
 
 static void
-do_store2(unsigned long addr, unsigned long x1, unsigned long x2)
+do_store2(unsigned long addr, unsigned long x1, unsigned long x2,
+	  unsigned long rsp)
 {
+	log_write(addr, rsp);
 	((unsigned long *)addr)[0] = x1;
 	((unsigned long *)addr)[1] = x2;
 }
@@ -241,7 +363,12 @@ constructLoggingStore(IRSB *irsb,
 	IRType t = typeOfIRExpr(irsb->tyenv, data);
 	IRTemp tmp1, tmp2;
 	int is_vector = 0;
+	IRTemp rsp;
 
+	rsp = newIRTemp(irsb->tyenv, Ity_I64);
+	addStmtToIRSB(irsb,
+		      IRStmt_WrTmp(rsp,
+				   IRExpr_Get(OFFSET_amd64_RSP, Ity_I64)));
 	switch (t) {
 	case Ity_I8:
 	case Ity_I16:
@@ -255,6 +382,7 @@ constructLoggingStore(IRSB *irsb,
 			       addr,
 			       IRExpr_RdTmp(tmp1),
 			       IRExpr_Const(IRConst_U64(sizeofIRType(t))),
+			       IRExpr_RdTmp(rsp),
 			       NULL);
 		break;
 	case Ity_I64:
@@ -264,6 +392,7 @@ constructLoggingStore(IRSB *irsb,
 			       addr,
 			       data,
 			       IRExpr_Const(IRConst_U64(8)),
+			       IRExpr_RdTmp(rsp),
 			       NULL);
 		break;
 	case Ity_V128:
@@ -291,6 +420,7 @@ constructLoggingStore(IRSB *irsb,
 			       addr,
 			       IRExpr_RdTmp(tmp1),
 			       IRExpr_RdTmp(tmp2),
+			       IRExpr_RdTmp(rsp),
 			       NULL);
 		break;
 	default:
