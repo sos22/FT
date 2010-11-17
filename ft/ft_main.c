@@ -14,6 +14,7 @@
 #include "pub_tool_stacktrace.h"
 #include "pub_tool_threadstate.h"
 #include "pub_tool_debuginfo.h"
+#include "pub_tool_options.h"
 
 #include "libvex_guest_offsets.h"
 
@@ -76,6 +77,18 @@ struct store_hash_entry {
 #define NR_STORE_HASH_HEADS 4097
 static struct store_hash_entry *
 store_hash_heads[NR_STORE_HASH_HEADS];
+
+struct thread_extra_data {
+	struct thread_extra_data *next;
+	ThreadId tid;
+	unsigned nr_stack_slots;
+	unsigned nr_stack_slots_allocated;
+	unsigned long *stack;
+};
+
+#define NR_THREAD_EXTRA_HEADS 32
+static struct thread_extra_data *
+thread_extra_heads[NR_THREAD_EXTRA_HEADS];
 
 static void
 build_tag(struct type_tag *t, ThreadId tid, SizeT sz)
@@ -234,6 +247,8 @@ ft_post_clo_init(void)
 	struct table_site_header tsh;
 	struct store_hash_entry *e;
 	unsigned long hash;
+
+	VG_(clo_vex_control).guest_chase_thresh = 0;
 
 	err = open_read_file(&rf, tag_table);
 	if (err) {
@@ -429,40 +444,60 @@ log_write_here(unsigned long addr, unsigned long rip)
 }
 
 static void
-log_write(unsigned long addr, unsigned long rsp)
+log_write(unsigned long addr, unsigned long rsp, unsigned long rip)
 {
-	Addr stack[8];
-	int n;
 	int r;
+	ThreadId tid;
+	struct thread_extra_data *ted;
 
 	if (addr >= rsp - 128 && addr < rsp + 8192) {
 		/* Quickly drop accesses to the stack. */
 		return;
 	}
 
-	n = VG_(get_StackTrace)(VG_(get_running_tid)(), stack, 8, NULL, NULL, 0);
-	for (r = 0; r < n; r++) {
-		if (log_write_here(addr, stack[r]))
+	/* Try accounting to this instruction. */
+	if (log_write_here(addr, rip))
+		return;
+
+	/* This instruction looks like it's in a memset()-like utility
+	   function, so uninteresting.  Account to the callers. */
+	tid = VG_(get_running_tid)();
+	for (ted = thread_extra_heads[tid % NR_THREAD_EXTRA_HEADS];
+	     ted && ted->tid != tid;
+	     ted = ted->next)
+		;
+	if (!ted) {
+		/* Stores which happen before the first function call
+		   are generally pretty damn uninteresting. */
+		return;
+	}
+	for (r = ted->nr_stack_slots - 1; r >= 0; r--) {
+		if (log_write_here(addr, ted->stack[r]))
 			return;
 	}
-	/* This is bad: the stack is apparently too deep for us to do
-	   anything with.  Just ignore this store. */
-	VG_(printf)("Stack too deep?\n");
+
+	/* Uh oh.  The entire program is memset()-like.  We're
+	 * screwed. */
+	VG_(printf)("Entire program is memset-like?\n");
+	VG_(printf)("%lx ", rip);
+	for (r = 0; r < ted->nr_stack_slots; r++)
+		VG_(printf)("%lx ", ted->stack[r]);
+	VG_(printf)("\n");
 }
 
 static void
 do_store(unsigned long addr, unsigned long data, unsigned long size,
-	 unsigned long rsp)
+	 unsigned long rsp, unsigned long rip)
 {
-	log_write(addr, rsp);
+	log_write(addr, rsp, rip);
 	VG_(memcpy)( (void *)addr, &data, size);
 }
 
 static void
 do_store2(unsigned long addr, unsigned long x1, unsigned long x2,
-	  unsigned long rsp)
+	  unsigned long rsp, unsigned long rip)
 {
-	log_write(addr, rsp);
+	log_write(addr, rsp, rip);
 	((unsigned long *)addr)[0] = x1;
 	((unsigned long *)addr)[1] = x2;
 }
@@ -470,7 +505,8 @@ do_store2(unsigned long addr, unsigned long x1, unsigned long x2,
 static void
 constructLoggingStore(IRSB *irsb,
 		      IRExpr *addr,
-		      IRExpr *data)
+		      IRExpr *data,
+		      unsigned long rip)
 {
 	IRType t = typeOfIRExpr(irsb->tyenv, data);
 	IRTemp tmp1, tmp2;
@@ -495,6 +531,7 @@ constructLoggingStore(IRSB *irsb,
 			       IRExpr_RdTmp(tmp1),
 			       IRExpr_Const(IRConst_U64(sizeofIRType(t))),
 			       IRExpr_RdTmp(rsp),
+			       IRExpr_Const(IRConst_U64(rip)),
 			       NULL);
 		break;
 	case Ity_I64:
@@ -505,6 +542,7 @@ constructLoggingStore(IRSB *irsb,
 			       data,
 			       IRExpr_Const(IRConst_U64(8)),
 			       IRExpr_RdTmp(rsp),
+			       IRExpr_Const(IRConst_U64(rip)),
 			       NULL);
 		break;
 	case Ity_V128:
@@ -533,11 +571,68 @@ constructLoggingStore(IRSB *irsb,
 			       IRExpr_RdTmp(tmp1),
 			       IRExpr_RdTmp(tmp2),
 			       IRExpr_RdTmp(rsp),
+			       IRExpr_Const(IRConst_U64(rip)),
 			       NULL);
 		break;
 	default:
 		VG_(tool_panic)("Store of unexpected type\n");
 	}
+}
+
+static void
+log_call(unsigned long ret_addr, unsigned long callee)
+{
+	ThreadId tid = VG_(get_running_tid)();
+	struct thread_extra_data *ted;
+	unsigned h = tid % NR_THREAD_EXTRA_HEADS;
+
+	for (ted = thread_extra_heads[h];
+	     ted && ted->tid != tid;
+	     ted = ted->next)
+		;
+	if (!ted) {
+		ted = VG_(malloc)("thread_extra_data", sizeof(*ted));
+		ted->tid = tid;
+		ted->next = thread_extra_heads[h];
+		ted->nr_stack_slots = 0;
+		ted->nr_stack_slots_allocated = 16;
+		ted->stack = VG_(malloc)("Thread stack", sizeof(ted->stack[0]) * ted->nr_stack_slots_allocated);
+		thread_extra_heads[h] = ted;
+	}
+	if (ted->nr_stack_slots == ted->nr_stack_slots_allocated) {
+		ted->nr_stack_slots_allocated *= 2;
+		ted->stack = VG_(realloc)("Thread stack",
+					  ted->stack,
+					  sizeof(ted->stack[0]) * ted->nr_stack_slots_allocated);
+	}
+	ted->stack[ted->nr_stack_slots] = ret_addr;
+	ted->nr_stack_slots++;
+}
+
+static void
+log_return(unsigned long to, unsigned long rip)
+{
+	ThreadId tid = VG_(get_running_tid)();
+	struct thread_extra_data *ted;
+	unsigned h = tid % NR_THREAD_EXTRA_HEADS;
+	int x;
+
+	for (ted = thread_extra_heads[h];
+	     ted && ted->tid != tid;
+	     ted = ted->next)
+		;
+
+	tl_assert(ted);
+	for (x = ted->nr_stack_slots - 1; x >= 0; x--) {
+		if (ted->stack[x] == to) {
+			if (x != ted->nr_stack_slots - 1)
+				VG_(printf)("Returning to something other than the calling function; did someone call longjmp?\n");
+			ted->nr_stack_slots = x;
+			return;
+		}
+	}
+	VG_(printf)("Returning to somewhere we never came from... (%lx)\n", to);
+	ted->nr_stack_slots = 0;
 }
 
 static IRSB *
@@ -551,16 +646,39 @@ ft_instrument(VgCallbackClosure* closure,
 	IRSB *out = deepCopyIRSBExceptStmts(bb);
 	int x;
 	IRStmt *stmt;
+	unsigned long instr_end;
+	unsigned long instr_start;
 
+	instr_end = 0xf001beefdeadcafe;
 	for (x = 0; x < bb->stmts_used; x++) {
 		stmt = bb->stmts[x];
 		if (stmt->tag != Ist_Store) {
 			addStmtToIRSB(out, stmt);
 		} else {
 			constructLoggingStore(out, stmt->Ist.Store.addr,
-					      stmt->Ist.Store.data);
+					      stmt->Ist.Store.data,
+					      instr_start);
+		}
+		if (stmt->tag == Ist_IMark) {
+			instr_start = stmt->Ist.IMark.addr;
+			instr_end = stmt->Ist.IMark.addr + stmt->Ist.IMark.len;
 		}
 	}
+
+	if (out->jumpkind == Ijk_Call)
+		add_dirty_call(out,
+			       "log_call",
+			       log_call,
+			       IRExpr_Const(IRConst_U64(instr_end)),
+			       out->next,
+			       NULL);
+	else if (out->jumpkind == Ijk_Ret)
+		add_dirty_call(out,
+			       "log_return",
+			       log_return,
+			       out->next,
+			       IRExpr_Const(IRConst_U64(instr_end)),
+			       NULL);
 	return out;
 }
 
