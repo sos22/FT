@@ -51,6 +51,7 @@
 #include "pub_core_xarray.h"
 #include "pub_core_oset.h"
 #include "pub_core_stacktrace.h" // VG_(get_StackTrace)
+#include "pub_core_tooliface.h"
 
 #include "priv_misc.h"           /* dinfo_zalloc/free */
 #include "priv_d3basics.h"       /* ML_(pp_GX) */
@@ -312,8 +313,10 @@ static void discard_DebugInfo ( DebugInfo* di )
                          reason);
          vg_assert(*prev_next_ptr == curr);
          *prev_next_ptr = curr->next;
-         if (curr->have_dinfo)
+         if (curr->have_dinfo) {
+	    VG_TRACK(unload_module, curr->rx_map_avma, curr->rx_map_size, curr->filename);
             VG_(redir_notify_delete_DebugInfo)( curr );
+	 }
          free_DebugInfo(curr);
          return;
       }
@@ -824,6 +827,8 @@ ULong VG_(di_notify_mmap)( Addr a, Bool allow_SkFileV )
          priv_storage.h. */
       check_CFSI_related_invariants(di);
 
+      VG_TRACK(load_module, di->rx_map_avma, di->rx_map_size,
+	       di->filename);
    } else {
       TRACE_SYMTAB("\n------ ELF reading failed ------\n");
       /* Something went wrong (eg. bad ELF file).  Should we delete

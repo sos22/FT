@@ -446,6 +446,12 @@ extern void VG_(needs_xml_output)( void );
    function here. */
 extern void VG_(needs_final_IR_tidy_pass) ( IRSB*(*final_tidy)(IRSB*) );
 
+extern void VG_(needs_load_unload) ( void (*load)(unsigned long base,
+						  unsigned long size,
+						  Char *fname),
+				     void (*unload)(unsigned long base,
+						    unsigned long size,
+						    Char *fname));
 
 /* ------------------------------------------------------------------ */
 /* Core events to track */

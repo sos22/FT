@@ -322,6 +322,21 @@ void VG_(needs_final_IR_tidy_pass)(
    VG_(tdict).tool_final_IR_tidy_pass = final_tidy;
 }
 
+void VG_(needs_load_unload) (
+   void (*load)(unsigned long base,
+		unsigned long size,
+		Char *fname),
+   void (*unload)(unsigned long base,
+		  unsigned long size,
+		  Char *fname)
+)
+{
+   VG_(needs).load_unload = True;
+   VG_(tdict).track_load_module = load;
+   VG_(tdict).track_unload_module = unload;
+}
+
+
 /*--------------------------------------------------------------------*/
 /* Tracked events.  Digit 'n' on DEFn is the REGPARMness. */
 
