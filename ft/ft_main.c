@@ -452,8 +452,32 @@ ft_instrument(VgCallbackClosure* closure,
 	return out;
 }
 
-static void nl_fini(Int exitcode)
+static void
+ft_fini(Int exitcode)
 {
+	/* Walk the store table and output the tag tables. */
+	int x;
+	int y;
+	struct store_hash_entry *e;
+
+	for (x = 0; x < NR_STORE_HASH_HEADS; x++) {
+		for (e = store_hash_heads[x]; e; e = e->next) {
+			if (e->nr_tags == 0)
+				continue;
+			VG_(printf)("%016lx\t%016lx:%lx:%x\t",
+				    e->rip,
+				    e->tag1.allocation_rip,
+				    e->tag1.allocation_size,
+				    e->tag1.offset);
+			for (y = 0; y < e->nr_tags - 1; y++) {
+				VG_(printf)("%016lx:%lx:%x\t",
+					    e->out_of_line_tags[y].allocation_rip,
+					    e->out_of_line_tags[y].allocation_size,
+					    e->out_of_line_tags[y].offset);
+			}
+			VG_(printf)("\n");
+		}
+	}
 }
 
 static void
@@ -513,7 +537,7 @@ static void nl_pre_clo_init(void)
 
    VG_(basic_tool_funcs)        (nl_post_clo_init,
                                  ft_instrument,
-                                 nl_fini);
+                                 ft_fini);
 
    VG_(needs_malloc_replacement)(my_malloc,
 				 my_malloc,
