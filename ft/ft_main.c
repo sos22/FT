@@ -1,6 +1,7 @@
 /* Based on nullgrind */
 #include <sys/types.h>
 #include <errno.h>
+#include <stdlib.h>
 
 #include "pub_tool_basics.h"
 #include "pub_tool_tooliface.h"
@@ -22,7 +23,7 @@ static const char *tag_table;
 
 struct type_tag {
 	unsigned long allocation_rip;
-	SizeT allocation_size;
+	long allocation_size;
 	unsigned offset;
 };
 
@@ -96,13 +97,16 @@ static struct thread_extra_data *
 thread_extra_heads[NR_THREAD_EXTRA_HEADS];
 
 static void
-build_tag(struct type_tag *t, ThreadId tid, SizeT sz)
+build_tag(struct type_tag *t, ThreadId tid, SizeT sz, int is_realloc)
 {
 	Addr stack[2];
 	int n;
 
 	t->offset = 0;
-	t->allocation_size = sz;
+	if (is_realloc)
+		t->allocation_size = -sz;
+	else
+		t->allocation_size = sz;
 	n = VG_(get_StackTrace)(tid, stack, 2, NULL, NULL, 0);
 	tl_assert(n == 2);
 	t->allocation_rip = stack[1];
@@ -143,7 +147,7 @@ clear_allocation_tag(void *p)
 		e = *pprev;
 	}
 	tl_assert(e);
-	sz = e->tag.allocation_size;
+	sz = labs(e->tag.allocation_size);
 	*pprev = e->next;
 	VG_(free)(e);
 	for (x = 16; x < sz; x += ADDR_REGION_SIZE) {
@@ -155,21 +159,21 @@ clear_allocation_tag(void *p)
 			e = *pprev;
 		}
 		tl_assert(e);
-		tl_assert(e->tag.allocation_size == sz);
+		tl_assert(labs(e->tag.allocation_size) == sz);
 		*pprev = e->next;
 		VG_(free)(e);
 	}
 }
 
 static void
-register_allocation(void *ptr, SizeT sz, ThreadId tid)
+register_allocation(void *ptr, SizeT sz, ThreadId tid, int is_realloc)
 {
 	int x;
 	struct address_hash_entry *e;
 	struct type_tag tag;
 	unsigned long h;
 
-	build_tag(&tag, tid, sz);
+	build_tag(&tag, tid, sz, is_realloc);
 
 	for (x = 0; x < sz; x += ADDR_REGION_SIZE) {
 		e = VG_(malloc)("address_hash_entry", sizeof(*e));
@@ -418,7 +422,9 @@ compact_ranges(struct store_hash_entry *e)
 		for (j = i + 1; j < e->nr_ranges; j++) {
 			fetch_range(e, j, &r2);
 			if (r1.t.allocation_rip != r2.t.allocation_rip ||
-			    r1.t.allocation_size != r2.t.allocation_size)
+			    (r1.t.allocation_size != r2.t.allocation_size &&
+			     !(r1.t.allocation_size < 0 &&
+			       r2.t.allocation_size < 0) ) )
 				continue;
 			if (r1.t.offset > r2.end ||
 			    r2.t.offset > r1.end)
@@ -476,7 +482,8 @@ log_write_here(unsigned long addr, unsigned long rip, unsigned size)
 
 retry:
 	if (rng.t.allocation_rip  == e->range1.t.allocation_rip &&
-	    rng.t.allocation_size == e->range1.t.allocation_size &&
+	    (rng.t.allocation_size == e->range1.t.allocation_size ||
+	     (rng.t.allocation_size < 0 && e->range1.t.allocation_size < 0)) &&
 	    rng.end               >= e->range1.t.offset &&
 	    rng.t.offset          <= e->range1.end) {
 		if (rng.t.offset < e->range1.t.offset)
@@ -487,7 +494,8 @@ retry:
 	}
 	for (x = 0; x < e->nr_ranges - 1; x++) {
 		if (rng.t.allocation_rip  == e->out_of_line_ranges[x].t.allocation_rip &&
-		    rng.t.allocation_size == e->out_of_line_ranges[x].t.allocation_size &&
+		    (rng.t.allocation_size == e->out_of_line_ranges[x].t.allocation_size ||
+		     (rng.t.allocation_size < 0 && e->out_of_line_ranges[x].t.allocation_size < 0) )&&
 		    rng.end               >= e->out_of_line_ranges[x].t.offset &&
 		    rng.t.offset          <= e->out_of_line_ranges[x].end) {
 			if (rng.t.offset < e->out_of_line_ranges[x].t.offset)
@@ -840,7 +848,6 @@ ft_fini(Int exitcode)
 	struct table_site_header tsh;
 	struct store_hash_entry *e;
 	int x;
-	int y;
 
 	x = open_write_file(&wf, tag_table);
 	if (x < 0)
@@ -850,10 +857,11 @@ ft_fini(Int exitcode)
 			tsh.rip = e->rip;
 			tsh.nr_ranges = e->nr_ranges;
 			write_file(&wf, &tsh, sizeof(tsh));
-			if (tsh.nr_ranges != 0)
+			if (tsh.nr_ranges != 0) {
 				write_file(&wf, &e->range1, sizeof(e->range1));
-			for (y = 0; y < e->nr_ranges - 1; y++)
-				write_file(&wf, &e->out_of_line_ranges[y], sizeof(e->out_of_line_ranges[y]));
+				write_file(&wf, e->out_of_line_ranges,
+					   sizeof(e->out_of_line_ranges[0]) * (e->nr_ranges - 1));
+			}
 		}
 	}
 	close_write_file(&wf);
@@ -870,13 +878,13 @@ static void *
 my_memalign(ThreadId tid, SizeT align, SizeT n)
 {
 	void *res;
-	if (align < 16)
-		align = 16;
-	n = (n + 15ul) & ~15ul;
+	if (align < 8)
+		align = 8;
+	n = (n + 7ul) & ~7ul;
 
 	res = VG_(cli_malloc)(align, n);
 	if (res)
-		register_allocation(res, n, tid);
+		register_allocation(res, n, tid, 0);
 	return res;
 }
 
@@ -889,7 +897,7 @@ my_malloc(ThreadId tid, SizeT n)
 static void *
 my_calloc(ThreadId tid, SizeT nmemb, SizeT size1)
 {
-	void *buf = my_malloc(8, nmemb * size1);
+	void *buf = my_malloc(tid, nmemb * size1);
 	VG_(memset)(buf, 0, nmemb * size1);
 	return buf;
 }
@@ -902,12 +910,16 @@ my_realloc(ThreadId tid, void *p, SizeT new_size)
 		my_free(tid, p);
 		return NULL;
 	}
-	if (p == NULL)
-		return my_malloc(tid, new_size);
+	if (p == NULL) {
+		n = VG_(cli_malloc)(8, new_size);
+		if (n)
+			register_allocation(n, new_size, tid, 1);
+		return n;
+	}
 	clear_allocation_tag(p);
 	n = VG_(cli_realloc)(p, new_size);
 	if (n != 0)
-		register_allocation(n, new_size, tid);
+		register_allocation(n, new_size, tid, 1);
 	return n;
 }
 
