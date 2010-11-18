@@ -875,9 +875,8 @@ my_memalign(ThreadId tid, SizeT align, SizeT n)
 	n = (n + 15ul) & ~15ul;
 
 	res = VG_(cli_malloc)(align, n);
-	if (!res)
-		return NULL;
-	register_allocation(res, n, tid);
+	if (res)
+		register_allocation(res, n, tid);
 	return res;
 }
 
@@ -899,6 +898,12 @@ static void *
 my_realloc(ThreadId tid, void *p, SizeT new_size)
 {
 	void *n;
+	if (new_size == 0) {
+		my_free(tid, p);
+		return NULL;
+	}
+	if (p == NULL)
+		return my_malloc(tid, new_size);
 	clear_allocation_tag(p);
 	n = VG_(cli_realloc)(p, new_size);
 	if (n != 0)
