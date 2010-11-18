@@ -63,16 +63,21 @@ address_hash_heads[NR_ADDR_HASH_ENTRIES];
    store with the same address, which makes some things a bit more
    convenient.
 */
-#define MAX_TAGS_PER_STORE 8
+#define MAX_RANGES_PER_STORE 8
+struct range { /* Indicates that this store can write to a range of
+		  bytes in a structure. */
+	struct type_tag t;
+	unsigned end;
+};
 struct store_hash_entry {
 	struct store_hash_entry *next;
 	unsigned long rip;
-	struct type_tag tag1; /* The common case is that each store
-				 writes precisely one tag, so keep one
-				 tag inline. */
-	int nr_tags; /* This is zero if we should backtrack another
+	struct range range1; /* The common case is that each store
+				writes precisely one range, so keep
+				one inline. */
+	int nr_ranges; /* This is zero if we should backtrack another
 			level up the call stack. */
-	struct type_tag *out_of_line_tags;
+	struct range *out_of_line_ranges;
 };
 #define NR_STORE_HASH_HEADS 4097
 static struct store_hash_entry *
@@ -236,7 +241,7 @@ close_read_file(struct read_file *rf)
 
 struct table_site_header {
 	unsigned long rip;
-	unsigned nr_tags;
+	unsigned nr_ranges;
 };
 
 static void
@@ -263,18 +268,19 @@ ft_post_clo_init(void)
 			break; /* Assume we hit end-of-file */
 		e = VG_(malloc)("store_hash_entry", sizeof(*e));
 		e->rip = tsh.rip;
-		e->nr_tags = tsh.nr_tags;
-		if (e->nr_tags != 0)
-			read_file(&rf, &e->tag1, sizeof(e->tag1));
-		if (e->nr_tags > 1) {
-			e->out_of_line_tags = VG_(malloc)("out of line tag table",
-							  sizeof(e->out_of_line_tags[0]) * (e->nr_tags - 1));
-			read_file(&rf, e->out_of_line_tags,
-				  sizeof(e->out_of_line_tags[0]) * (e->nr_tags - 1));
+		e->nr_ranges = tsh.nr_ranges;
+		if (e->nr_ranges != 0)
+			read_file(&rf, &e->range1, sizeof(e->range1));
+		if (e->nr_ranges > 1) {
+			e->out_of_line_ranges =
+				VG_(malloc)("out of line range table",
+					    sizeof(e->out_of_line_ranges[0]) * (e->nr_ranges - 1));
+			read_file(&rf, e->out_of_line_ranges,
+				  sizeof(e->out_of_line_ranges[0]) * (e->nr_ranges - 1));
 		}
 		hash = hash_store_addr(e->rip);
 		e->next = store_hash_heads[hash];
-		//store_hash_heads[hash] = e;
+		store_hash_heads[hash] = e;
 	}
 	close_read_file(&rf);
 }
@@ -356,14 +362,6 @@ add_dirty_call(IRSB *irsb,
 }
 
 static int
-tags_eq(const struct type_tag *a, const struct type_tag *b)
-{
-	return a->allocation_rip == b->allocation_rip &&
-		a->allocation_size == b->allocation_size &&
-		a->offset == b->offset;
-}
-
-static int
 fetch_tag(unsigned long addr, struct type_tag *type)
 {
 	unsigned long h = hash_ptr((void *)(addr - (addr % ADDR_REGION_SIZE)));
@@ -384,67 +382,162 @@ fetch_tag(unsigned long addr, struct type_tag *type)
 	return 1;
 }
 
+static void
+fetch_range(const struct store_hash_entry *e, int i, struct range *out)
+{
+	tl_assert(i < e->nr_ranges);
+	if (i == 0)
+		*out = e->range1;
+	else
+		*out = e->out_of_line_ranges[i-1];
+}
+
+static void
+store_range(struct store_hash_entry *e, int i, const struct range *r)
+{
+	tl_assert(i < e->nr_ranges);
+	if (i == 0)
+		e->range1 = *r;
+	else
+		e->out_of_line_ranges[i-1] = *r;
+}
+
+/* Walk over the list of ranges and try to merge any which are
+ * contiguous. */
 static int
-log_write_here(unsigned long addr, unsigned long rip)
+compact_ranges(struct store_hash_entry *e)
+{
+	int i;
+	int j;
+	struct range r1;
+	struct range r2;
+	int done_something = 0;
+
+	for (i = 0; i < e->nr_ranges; i++) {
+		fetch_range(e, i, &r1);
+		for (j = i + 1; j < e->nr_ranges; j++) {
+			fetch_range(e, j, &r2);
+			if (r1.t.allocation_rip != r2.t.allocation_rip ||
+			    r1.t.allocation_size != r2.t.allocation_size)
+				continue;
+			if (r1.t.offset > r2.end ||
+			    r2.t.offset > r1.end)
+				continue;
+
+			/* These can be merged. */
+			done_something = 1;
+			if (r1.t.offset > r2.t.offset)
+				r1.t.offset = r2.t.offset;
+			if (r1.end < r2.end)
+				r1.end = r2.end;
+			store_range(e, i, &r1);
+			VG_(memmove)(e->out_of_line_ranges + j,
+				     e->out_of_line_ranges + j + 1,
+				     sizeof(e->out_of_line_ranges[0]) *
+				     (e->nr_ranges - j - 1));
+			e->nr_ranges--;
+			j--;
+		}
+	}
+	return done_something;
+}
+
+static int
+log_write_here(unsigned long addr, unsigned long rip, unsigned size)
 {
 	unsigned long hash = hash_store_addr(rip);
 	struct store_hash_entry *e;
-	struct type_tag tag;
+	struct range rng;
 	int x;
 
 	e = store_hash_heads[hash];
 	while (e && e->rip != rip)
 		e = e->next;
-	if (e && e->nr_tags == 0) {
+	if (e && e->nr_ranges == 0) {
 		/* This is a special entry which indicates that we
 		   should examine further up the call stack. */
 		return 0;
 	}
-	if (!fetch_tag(addr, &tag)) {
+	if (!fetch_tag(addr, &rng.t)) {
 		/* Not a malloc address */
 		return 1;
 	}
+	rng.end = rng.t.offset + size;
 	if (!e) {
 		/* First store issued by this instruction */
 		e = VG_(malloc)("store_hash_entry", sizeof(*e));
 		e->rip = rip;
-		e->nr_tags = 1;
-		e->tag1 = tag;
+		e->nr_ranges = 1;
+		e->range1 = rng;
 		e->next = store_hash_heads[hash];
 		store_hash_heads[hash] = e;
 		return 1;
 	}
 
-	if (tags_eq(&e->tag1, &tag))
+retry:
+	if (rng.t.allocation_rip  == e->range1.t.allocation_rip &&
+	    rng.t.allocation_size == e->range1.t.allocation_size &&
+	    rng.end               >= e->range1.t.offset &&
+	    rng.t.offset          <= e->range1.end) {
+		if (rng.t.offset < e->range1.t.offset)
+			e->range1.t.offset = rng.t.offset;
+		if (rng.end > e->range1.end)
+			e->range1.end = rng.end;
 		return 1;
-	for (x = 0; x < e->nr_tags - 1; x++)
-		if (tags_eq(&e->out_of_line_tags[x], &tag))
+	}
+	for (x = 0; x < e->nr_ranges - 1; x++) {
+		if (rng.t.allocation_rip  == e->out_of_line_ranges[x].t.allocation_rip &&
+		    rng.t.allocation_size == e->out_of_line_ranges[x].t.allocation_size &&
+		    rng.end               >= e->out_of_line_ranges[x].t.offset &&
+		    rng.t.offset          <= e->out_of_line_ranges[x].end) {
+			if (rng.t.offset < e->out_of_line_ranges[x].t.offset)
+				e->out_of_line_ranges[x].t.offset = rng.t.offset;
+			if (rng.end > e->out_of_line_ranges[x].end)
+				e->out_of_line_ranges[x].end = rng.end;
 			return 1;
-	if (e->nr_tags == MAX_TAGS_PER_STORE) {
+		}
+	}
+	if (e->nr_ranges == MAX_RANGES_PER_STORE) {
+		if (compact_ranges(e))
+			goto retry;
+
 		/* Whoops.  This instruction appears to write to too
 		   many distinct types, so it's probably e.g. part of
 		   a memset or equivalent.  Use the enclosing function
 		   instead. */
-		e->nr_tags = 0;
+		VG_(printf)("%lx becomes memset-like.\n", rip);
+		VG_(printf)("%lx:%lx:%x:%x ",
+			    e->range1.t.allocation_rip,
+			    e->range1.t.allocation_size,
+			    e->range1.t.offset,
+			    e->range1.end);
+		for (x = 0; x < e->nr_ranges - 1; x++)
+			VG_(printf)("%lx:%lx:%x:%x ",
+				    e->out_of_line_ranges[x].t.allocation_rip,
+				    e->out_of_line_ranges[x].t.allocation_size,
+				    e->out_of_line_ranges[x].t.offset,
+				    e->out_of_line_ranges[x].end);
+		VG_(printf)("\n");
+		e->nr_ranges = 0;
 		return 0;
 	}
 
-	if (e->nr_tags == 1) {
-		e->out_of_line_tags = VG_(malloc)("out of line tags",
-						  sizeof(*e->out_of_line_tags));
+	if (e->nr_ranges == 1) {
+		e->out_of_line_ranges = VG_(malloc)("out of line ranges",
+						    sizeof(*e->out_of_line_ranges));
 	} else {
-		e->out_of_line_tags = VG_(realloc)("out of line tags",
-						   e->out_of_line_tags,
-						   sizeof(*e->out_of_line_tags) *
-						   e->nr_tags);
+		e->out_of_line_ranges = VG_(realloc)("out of line tags",
+						     e->out_of_line_ranges,
+						     sizeof(*e->out_of_line_ranges) *
+						     e->nr_ranges);
 	}
-	e->out_of_line_tags[e->nr_tags-1] = tag;
-	e->nr_tags++;
+	e->out_of_line_ranges[e->nr_ranges-1] = rng;
+	e->nr_ranges++;
 	return 1;
 }
 
 static void
-log_write(unsigned long addr, unsigned long rsp, unsigned long rip)
+log_write(unsigned long addr, unsigned long rsp, unsigned long rip, unsigned size)
 {
 	int r;
 	ThreadId tid;
@@ -456,7 +549,7 @@ log_write(unsigned long addr, unsigned long rsp, unsigned long rip)
 	}
 
 	/* Try accounting to this instruction. */
-	if (log_write_here(addr, rip))
+	if (log_write_here(addr, rip, size))
 		return;
 
 	/* This instruction looks like it's in a memset()-like utility
@@ -472,7 +565,7 @@ log_write(unsigned long addr, unsigned long rsp, unsigned long rip)
 		return;
 	}
 	for (r = ted->nr_stack_slots - 1; r >= 0; r--) {
-		if (log_write_here(addr, ted->stack[r]))
+		if (log_write_here(addr, ted->stack[r], size))
 			return;
 	}
 
@@ -489,7 +582,7 @@ static void
 do_store(unsigned long addr, unsigned long data, unsigned long size,
 	 unsigned long rsp, unsigned long rip)
 {
-	log_write(addr, rsp, rip);
+	log_write(addr, rsp, rip, size);
 	VG_(memcpy)( (void *)addr, &data, size);
 }
 
@@ -497,7 +590,7 @@ static void
 do_store2(unsigned long addr, unsigned long x1, unsigned long x2,
 	  unsigned long rsp, unsigned long rip)
 {
-	log_write(addr, rsp, rip);
+	log_write(addr, rsp, rip, 16);
 	((unsigned long *)addr)[0] = x1;
 	((unsigned long *)addr)[1] = x2;
 }
@@ -649,6 +742,7 @@ ft_instrument(VgCallbackClosure* closure,
 	unsigned long instr_end;
 	unsigned long instr_start;
 
+	instr_start = 0xdeadbeefbabe;
 	instr_end = 0xf001beefdeadcafe;
 	for (x = 0; x < bb->stmts_used; x++) {
 		stmt = bb->stmts[x];
@@ -754,12 +848,12 @@ ft_fini(Int exitcode)
 	for (x = 0; x < NR_STORE_HASH_HEADS; x++) {
 		for (e = store_hash_heads[x]; e; e = e->next) {
 			tsh.rip = e->rip;
-			tsh.nr_tags = e->nr_tags;
+			tsh.nr_ranges = e->nr_ranges;
 			write_file(&wf, &tsh, sizeof(tsh));
-			if (tsh.nr_tags != 0)
-				write_file(&wf, &e->tag1, sizeof(e->tag1));
-			for (y = 0; y < e->nr_tags - 1; y++)
-				write_file(&wf, &e->out_of_line_tags[y], sizeof(e->out_of_line_tags[y]));
+			if (tsh.nr_ranges != 0)
+				write_file(&wf, &e->range1, sizeof(e->range1));
+			for (y = 0; y < e->nr_ranges - 1; y++)
+				write_file(&wf, &e->out_of_line_ranges[y], sizeof(e->out_of_line_ranges[y]));
 		}
 	}
 	close_write_file(&wf);
