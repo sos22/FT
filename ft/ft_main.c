@@ -19,13 +19,9 @@
 
 #include "libvex_guest_offsets.h"
 
-static const char *tag_table;
+#include "dumpfile.h"
 
-struct type_tag {
-	unsigned long allocation_rip;
-	long allocation_size;
-	unsigned offset;
-};
+static const char *tag_table;
 
 /* A couple of experiments on inkscape:
 
@@ -45,6 +41,8 @@ struct type_tag {
 struct address_hash_entry {
 	struct address_hash_entry *next;
 	unsigned long addr;
+	int is_private; /* This location is believed to be (roughly)
+			 * private heap. */
 	struct type_tag tag;
 };
 
@@ -65,11 +63,6 @@ address_hash_heads[NR_ADDR_HASH_ENTRIES];
    convenient.
 */
 #define MAX_RANGES_PER_STORE 8
-struct range { /* Indicates that this store can write to a range of
-		  bytes in a structure. */
-	struct type_tag t;
-	unsigned end;
-};
 struct store_hash_entry {
 	struct store_hash_entry *next;
 	unsigned long rip;
@@ -132,6 +125,18 @@ hash_store_addr(unsigned long rip)
 	return hash;
 }
 
+static struct address_hash_entry *
+find_address_hash_entry(unsigned long addr)
+{
+	struct address_hash_entry *e;
+	addr -= addr % ADDR_REGION_SIZE;
+	for (e = address_hash_heads[hash_ptr((void *)addr)];
+	     e && e->addr != addr;
+	     e = e->next)
+		;
+	return e;
+}
+
 static void
 clear_allocation_tag(void *p)
 {
@@ -179,6 +184,7 @@ register_allocation(void *ptr, SizeT sz, ThreadId tid, int is_realloc)
 		e = VG_(malloc)("address_hash_entry", sizeof(*e));
 		e->addr = (unsigned long)ptr + x;
 		e->tag = tag;
+		e->is_private = 1;
 		e->tag.offset = x;
 		h = hash_ptr((void *)e->addr);
 		e->next = address_hash_heads[h];
@@ -242,11 +248,6 @@ close_read_file(struct read_file *rf)
 {
 	VG_(close)(rf->fd);
 }
-
-struct table_site_header {
-	unsigned long rip;
-	unsigned nr_ranges;
-};
 
 static void
 ft_post_clo_init(void)
@@ -381,8 +382,10 @@ fetch_tag(unsigned long addr, struct type_tag *type)
 	*pprev = e->next;
 	e->next = address_hash_heads[h];
 	address_hash_heads[h] = e;
-	*type = e->tag;
-	type->offset += addr % ADDR_REGION_SIZE;
+	if (type) {
+		*type = e->tag;
+		type->offset += addr % ADDR_REGION_SIZE;
+	}
 	return 1;
 }
 
@@ -449,7 +452,7 @@ compact_ranges(struct store_hash_entry *e)
 }
 
 static int
-log_write_here(unsigned long addr, unsigned long rip, unsigned size)
+log_write_here(unsigned long addr, unsigned long rip, unsigned size, const struct address_hash_entry *ahe)
 {
 	unsigned long hash = hash_store_addr(rip);
 	struct store_hash_entry *e;
@@ -464,10 +467,8 @@ log_write_here(unsigned long addr, unsigned long rip, unsigned size)
 		   should examine further up the call stack. */
 		return 0;
 	}
-	if (!fetch_tag(addr, &rng.t)) {
-		/* Not a malloc address */
-		return 1;
-	}
+	rng.t = ahe->tag;
+	rng.t.offset += addr % ADDR_REGION_SIZE;
 	rng.end = rng.t.offset + size;
 	if (!e) {
 		/* First store issued by this instruction */
@@ -545,19 +546,14 @@ retry:
 }
 
 static void
-log_write(unsigned long addr, unsigned long rsp, unsigned long rip, unsigned size)
+log_write(unsigned long addr, unsigned long rip, unsigned size, struct address_hash_entry *ahe)
 {
 	int r;
 	ThreadId tid;
 	struct thread_extra_data *ted;
 
-	if (addr >= rsp - 128 && addr < rsp + 8192) {
-		/* Quickly drop accesses to the stack. */
-		return;
-	}
-
 	/* Try accounting to this instruction. */
-	if (log_write_here(addr, rip, size))
+	if (log_write_here(addr, rip, size, ahe))
 		return;
 
 	/* This instruction looks like it's in a memset()-like utility
@@ -573,7 +569,7 @@ log_write(unsigned long addr, unsigned long rsp, unsigned long rip, unsigned siz
 		return;
 	}
 	for (r = ted->nr_stack_slots - 1; r >= 0; r--) {
-		if (log_write_here(addr, ted->stack[r], size))
+		if (log_write_here(addr, ted->stack[r], size, ahe))
 			return;
 	}
 
@@ -586,11 +582,58 @@ log_write(unsigned long addr, unsigned long rsp, unsigned long rip, unsigned siz
 	VG_(printf)("\n");
 }
 
+/* If @value points at the heap, and the location it points it is
+   currently thread-private, redesignate it as process-global, walking
+   any pointers in the allocation and redesignating them as well. */
+static void
+consider_deprivatising(unsigned long value)
+{
+	struct address_hash_entry *e = find_address_hash_entry(value);
+	unsigned long alloc_sz;
+	unsigned long alloc_start;
+	unsigned long ptr;
+	unsigned long ptr2;
+
+	if (!e || !e->is_private)
+		return;
+
+	/* Now go and do the privatisation step. */
+	alloc_start = value - e->tag.offset;
+	alloc_sz = e->tag.allocation_size;
+
+	/* Deprivatise the entire allocation.  We do this in two steps to
+	   help avoid unnecessary recursion later. */
+	for (ptr = alloc_start; ptr < alloc_start + alloc_sz; ptr += 8) {
+		e = find_address_hash_entry(ptr);
+		tl_assert(e);
+		e->is_private = 0;
+	}
+
+	/* Now privatise everything which is reachable from this
+	 * block, recursively. */
+	for (ptr = alloc_start; ptr < alloc_start + alloc_sz; ptr += 8) {
+		/* This dereference is safe because we know that it's
+		   in a block which has been malloc()ed and not
+		   free()ed. */
+		ptr2 = *(unsigned long *)ptr;
+		/* Hopefully the recursion will be nice and shallow... */
+		consider_deprivatising(ptr2);
+	}
+}
+
 static void
 do_store(unsigned long addr, unsigned long data, unsigned long size,
 	 unsigned long rsp, unsigned long rip)
 {
-	log_write(addr, rsp, rip, size);
+	if (addr < rsp - 128 || addr >= rsp + 8192) {
+		struct address_hash_entry *e = find_address_hash_entry(addr);
+		if (e)
+			log_write(addr, rip, size, e);
+		if (size == 8 &&
+		    (!e || !e->is_private) &&
+		    !(addr % 8))
+			consider_deprivatising(data);
+	}
 	VG_(memcpy)( (void *)addr, &data, size);
 }
 
@@ -598,7 +641,15 @@ static void
 do_store2(unsigned long addr, unsigned long x1, unsigned long x2,
 	  unsigned long rsp, unsigned long rip)
 {
-	log_write(addr, rsp, rip, 16);
+	if (addr >= rsp - 128 && addr < rsp + 8192) {
+		struct address_hash_entry *e = find_address_hash_entry(addr);
+		if (e)
+			log_write(addr, rip, 16, e);
+		if ((!e || !e->is_private) && !(addr % 8)) {
+			consider_deprivatising(x1);
+			consider_deprivatising(x2);
+		}
+	}
 	((unsigned long *)addr)[0] = x1;
 	((unsigned long *)addr)[1] = x2;
 }
@@ -833,7 +884,7 @@ static void
 close_write_file(struct write_file *wf)
 {
 	int x, y;
-	for (x = 0; x < wf->buf_prod; x++) {
+	for (x = 0; x < wf->buf_prod; x+= y) {
 		y = VG_(write)(wf->fd, wf->buf + x, wf->buf_prod - x);
 		tl_assert(y > 0);
 	}
