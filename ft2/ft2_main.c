@@ -262,9 +262,107 @@ ft2_instrument(VgCallbackClosure* closure,
 	return b;
 }
 
+struct set_of_sets_entry {
+	struct set_of_sets_entry *next;
+	unsigned long h;
+	struct address_set content;
+};
+
+#define NR_SS_HEADS 32768
+static struct set_of_sets_entry *
+ss_heads[NR_SS_HEADS];
+
+static unsigned long
+hash_address_set(const struct address_set *s)
+{
+	unsigned long hash;
+	int x;
+
+	switch (s->nr_entries) {
+	case 0:
+		return 0;
+	case 1:
+		return s->entry0;
+	case 2:
+		return s->entry0 * 4099 + s->u.entry1;
+	default:
+		hash = s->entry0;
+		for (x = 1; x < s->nr_entries; x++)
+			hash = hash * 8191 + s->u.entry1N[x-1];
+		return hash;
+	}
+}
+
+static int
+sets_equal(const struct address_set *s1, const struct address_set *s2)
+{
+	int x;
+
+	if (s1->nr_entries != s2->nr_entries)
+		return 0;
+	if (s1->nr_entries == 0)
+		return 1;
+	if (s1->entry0 != s2->entry0)
+		return 0;
+	if (s1->nr_entries == 1)
+		return 1;
+	if (s1->nr_entries == 2)
+		return s1->u.entry1 == s2->u.entry1;
+	for (x = 0; x < s1->nr_entries - 1; x++)
+		if (s1->u.entry1N[x] != s2->u.entry1N[x])
+			return 0;
+	return 1;
+}
+
+/* Add the set @s to the global set of sets. */
+static void
+fold_set_to_global_set(struct address_set *s)
+{
+	unsigned long h = hash_address_set(s);
+	unsigned head = h % NR_SS_HEADS;
+	struct set_of_sets_entry *sse;
+	for (sse = ss_heads[head]; sse; sse = sse->next) {
+		if (sse->h == h &&
+		    sets_equal(s, &sse->content))
+			return;
+	}
+
+	sse = VG_(malloc)("set_of_sets_entry", sizeof(*sse));
+	sse->h = h;
+	sse->content = *s;
+	s->nr_entries = 0;
+	s->nr_entries_allocated = 0;
+	sse->next = ss_heads[head];
+	ss_heads[head] = sse;
+}
+
 static void
 ft2_fini(Int exitcode)
 {
+	int x;
+	int y;
+	struct addr_hash_entry *ahe;
+	struct set_of_sets_entry *sse;
+
+	for (x = 0; x < NR_ADDR_HASH_HEADS; x++)
+		for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next)
+			fold_set_to_global_set(&ahe->stores);
+
+	for (x = 0; x < NR_SS_HEADS; x++) {
+		for (sse = ss_heads[x]; sse; sse = sse->next) {
+			VG_(printf)("SSE:");
+			if (sse->content.nr_entries > 0) {
+				VG_(printf)("\t%lx", sse->content.entry0);
+				if (sse->content.nr_entries == 2) {
+					VG_(printf)("\t%lx\n", sse->content.u.entry1);
+				} else {
+					for (y = 0; y < sse->content.nr_entries-1; y++)
+						VG_(printf)("\t%lx", sse->content.u.entry1N[y]);
+					VG_(printf)("\n");
+				}
+			}
+		}
+	}
 }
 
 static void
