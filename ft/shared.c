@@ -2,6 +2,18 @@
    library common to two components in Automake, so just do it by
    #include'ing the relevant .c file. */
 
+struct thread_extra_data {
+	struct thread_extra_data *next;
+	ThreadId tid;
+	unsigned nr_stack_slots;
+	unsigned nr_stack_slots_allocated;
+	unsigned long *stack;
+};
+
+#define NR_THREAD_EXTRA_HEADS 32
+static struct thread_extra_data *
+thread_extra_heads[NR_THREAD_EXTRA_HEADS];
+
 static void do_store(unsigned long addr, unsigned long data, unsigned long size,
 		     unsigned long rsp, unsigned long rip);
 static void do_store2(unsigned long addr, unsigned long x1, unsigned long x2,

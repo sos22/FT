@@ -78,18 +78,6 @@ struct store_hash_entry {
 static struct store_hash_entry *
 store_hash_heads[NR_STORE_HASH_HEADS];
 
-struct thread_extra_data {
-	struct thread_extra_data *next;
-	ThreadId tid;
-	unsigned nr_stack_slots;
-	unsigned nr_stack_slots_allocated;
-	unsigned long *stack;
-};
-
-#define NR_THREAD_EXTRA_HEADS 32
-static struct thread_extra_data *
-thread_extra_heads[NR_THREAD_EXTRA_HEADS];
-
 #include "shared.c"
 
 static void
