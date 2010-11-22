@@ -10,6 +10,7 @@ TOOLS =		memcheck \
 		lackey \
 		none \
 		ft \
+		ft2 \
 		helgrind \
 		drd
 
