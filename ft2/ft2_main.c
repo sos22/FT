@@ -31,6 +31,24 @@ struct addr_hash_entry {
 static struct addr_hash_entry *
 addr_hash_heads[NR_ADDR_HASH_HEADS];
 
+static void
+sanity_check_set(const struct address_set *as)
+{
+	int x;
+
+	tl_assert(as->nr_entries >= 0);
+	if (as->nr_entries <= 1)
+		return;
+	if (as->nr_entries == 2) {
+		tl_assert(as->entry0 < as->u.entry1);
+		return;
+	}
+	tl_assert(as->nr_entries <= as->nr_entries_allocated);
+	tl_assert(as->entry0 < as->u.entry1N[0]);
+	for (x = 0; x < as->nr_entries-2; x++)
+		tl_assert(as->u.entry1N[x] < as->u.entry1N[x+1]);
+}
+
 static unsigned
 hash_address(unsigned long addr)
 {
@@ -63,6 +81,7 @@ add_address_to_set(struct address_set *set, unsigned long addr)
 	unsigned long t;
 	int low, high;
 
+	tl_assert(addr != 0);
 	if (set->nr_entries == 0) {
 		set->entry0 = addr;
 	} else if (set->nr_entries == 1) {
@@ -195,6 +214,7 @@ add_address_to_set(struct address_set *set, unsigned long addr)
 		}
 	}
 	set->nr_entries++;
+	sanity_check_set(set);
 }
 
 static void
