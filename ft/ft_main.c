@@ -20,6 +20,7 @@
 #include "libvex_guest_offsets.h"
 
 #include "dumpfile.h"
+#include "ft.h"
 
 static const char *tag_table;
 
@@ -88,6 +89,8 @@ struct thread_extra_data {
 #define NR_THREAD_EXTRA_HEADS 32
 static struct thread_extra_data *
 thread_extra_heads[NR_THREAD_EXTRA_HEADS];
+
+#include "shared.c"
 
 static void
 build_tag(struct type_tag *t, ThreadId tid, SizeT sz, int is_realloc)
@@ -192,63 +195,6 @@ register_allocation(void *ptr, SizeT sz, ThreadId tid, int is_realloc)
 	}
 }
 
-struct read_file {
-	int fd;
-	unsigned buf_cons;
-	unsigned buf_prod;
-	unsigned char buf[128];
-};
-
-static int
-open_read_file(struct read_file *out, const Char *fname)
-{
-	SysRes sr;
-
-	sr = VG_(open)(tag_table, VKI_O_RDONLY, 0);
-	if (sr.isError)
-		return sr.err;
-	out->fd = sr.res;
-	out->buf_cons = 0;
-	out->buf_prod = 0;
-	return 0;
-}
-
-static int
-read_file(struct read_file *rf, void *buf, size_t sz)
-{
-	unsigned to_copy;
-	Int x;
-
-	if (sz == 0)
-		return 1;
-	while (1) {
-		to_copy = sz;
-		if (rf->buf_prod > rf->buf_cons) {
-			if (rf->buf_prod - rf->buf_cons < sz)
-				to_copy = rf->buf_prod - rf->buf_cons;
-			VG_(memcpy)(buf, rf->buf + rf->buf_cons, to_copy);
-			rf->buf_cons += to_copy;
-			sz -= to_copy;
-			buf = (void *)((unsigned long)buf + to_copy);
-			if (!sz)
-				return 1;
-		}
-		tl_assert(rf->buf_prod == rf->buf_cons);
-		rf->buf_cons = rf->buf_prod = 0;
-		x = VG_(read)(rf->fd, rf->buf + rf->buf_prod, sizeof(rf->buf) - rf->buf_prod);
-		if (x == 0)
-			return 0;
-		tl_assert(x > 0);
-		rf->buf_prod += x;
-	}
-}
-
-static void
-close_read_file(struct read_file *rf)
-{
-	VG_(close)(rf->fd);
-}
-
 static void
 ft_post_clo_init(void)
 {
@@ -288,82 +234,6 @@ ft_post_clo_init(void)
 		store_hash_heads[hash] = e;
 	}
 	close_read_file(&rf);
-}
-
-static IRTemp
-cast_to_U64(IRSB *irsb, IRExpr *expr)
-{
-	IROp op;
-	IRTemp tmp;
-
-	switch (typeOfIRExpr(irsb->tyenv, expr)) {
-	case Ity_I8:
-		op = Iop_8Uto64;
-		break;
-	case Ity_I16:
-		op = Iop_16Uto64;
-		break;
-	case Ity_I32:
-		op = Iop_32Uto64;
-		break;
-	case Ity_F64:
-		op = Iop_ReinterpF64asI64;
-		break;
-	case Ity_F32:
-		tmp = newIRTemp(irsb->tyenv, Ity_I32);
-		addStmtToIRSB(irsb,
-			      IRStmt_WrTmp(tmp,
-					   IRExpr_Unop(Iop_ReinterpF32asI32,
-						       expr)));
-		return cast_to_U64(irsb,
-				   IRExpr_RdTmp(tmp));
-	default:
-		VG_(tool_panic)((Char *)"Weird-arse type problem.\n");
-	}
-	tmp = newIRTemp(irsb->tyenv, Ity_I64);
-	addStmtToIRSB(irsb,
-		      IRStmt_WrTmp(tmp,
-				   IRExpr_Unop(op, expr)));
-	return tmp;
-}
-
-static void
-add_dirty_call(IRSB *irsb,
-	       char *name,
-	       void *ptr,
-	       ...)
-{
-	va_list args;
-	int nr_args;
-	IRExpr *e;
-	IRExpr **arg_v;
-	IRDirty *dirty;
-
-	va_start(args, ptr);
-	nr_args = 0;
-	while (1) {
-		e = va_arg(args, IRExpr *);
-		if (!e)
-			break;
-		nr_args++;
-	}
-	va_end(args);
-
-	arg_v = LibVEX_Alloc( (nr_args + 1) * sizeof(arg_v[0]) );
-	va_start(args, ptr);
-	nr_args = 0;
-	while (1) {
-		e = va_arg(args, IRExpr *);
-		if (!e)
-			break;
-		arg_v[nr_args] = e;
-		nr_args++;
-	}
-	arg_v[nr_args] = NULL;
-	va_end(args);
-
-	dirty = unsafeIRDirty_0_N(0, name, ptr, arg_v);
-	addStmtToIRSB(irsb, IRStmt_Dirty(dirty) );
 }
 
 static int
@@ -654,139 +524,6 @@ do_store2(unsigned long addr, unsigned long x1, unsigned long x2,
 	((unsigned long *)addr)[1] = x2;
 }
 
-static void
-constructLoggingStore(IRSB *irsb,
-		      IRExpr *addr,
-		      IRExpr *data,
-		      unsigned long rip)
-{
-	IRType t = typeOfIRExpr(irsb->tyenv, data);
-	IRTemp tmp1, tmp2;
-	int is_vector = 0;
-	IRTemp rsp;
-
-	rsp = newIRTemp(irsb->tyenv, Ity_I64);
-	addStmtToIRSB(irsb,
-		      IRStmt_WrTmp(rsp,
-				   IRExpr_Get(OFFSET_amd64_RSP, Ity_I64)));
-	switch (t) {
-	case Ity_I8:
-	case Ity_I16:
-	case Ity_I32:
-	case Ity_F32:
-	case Ity_F64:
-		tmp1 = cast_to_U64(irsb, data);
-		add_dirty_call(irsb,
-			       "do_store",
-			       do_store,
-			       addr,
-			       IRExpr_RdTmp(tmp1),
-			       IRExpr_Const(IRConst_U64(sizeofIRType(t))),
-			       IRExpr_RdTmp(rsp),
-			       IRExpr_Const(IRConst_U64(rip)),
-			       NULL);
-		break;
-	case Ity_I64:
-		add_dirty_call(irsb,
-			       "do_store",
-			       do_store,
-			       addr,
-			       data,
-			       IRExpr_Const(IRConst_U64(8)),
-			       IRExpr_RdTmp(rsp),
-			       IRExpr_Const(IRConst_U64(rip)),
-			       NULL);
-		break;
-	case Ity_V128:
-		is_vector = 1;
-	case Ity_I128:
-		tmp1 = newIRTemp(irsb->tyenv, Ity_I64);
-		tmp2 = newIRTemp(irsb->tyenv, Ity_I64);
-		addStmtToIRSB(
-			irsb,
-			IRStmt_WrTmp(
-				tmp1,
-				IRExpr_Unop(
-					is_vector ? Iop_V128to64 : Iop_128to64,
-					data)));
-		addStmtToIRSB(
-			irsb,
-			IRStmt_WrTmp(
-				tmp2,
-				IRExpr_Unop(
-					is_vector ? Iop_V128HIto64 : Iop_128HIto64,
-					data)));
-		add_dirty_call(irsb,
-			       "do_store2",
-			       do_store2,
-			       addr,
-			       IRExpr_RdTmp(tmp1),
-			       IRExpr_RdTmp(tmp2),
-			       IRExpr_RdTmp(rsp),
-			       IRExpr_Const(IRConst_U64(rip)),
-			       NULL);
-		break;
-	default:
-		VG_(tool_panic)("Store of unexpected type\n");
-	}
-}
-
-static void
-log_call(unsigned long ret_addr, unsigned long callee)
-{
-	ThreadId tid = VG_(get_running_tid)();
-	struct thread_extra_data *ted;
-	unsigned h = tid % NR_THREAD_EXTRA_HEADS;
-
-	for (ted = thread_extra_heads[h];
-	     ted && ted->tid != tid;
-	     ted = ted->next)
-		;
-	if (!ted) {
-		ted = VG_(malloc)("thread_extra_data", sizeof(*ted));
-		ted->tid = tid;
-		ted->next = thread_extra_heads[h];
-		ted->nr_stack_slots = 0;
-		ted->nr_stack_slots_allocated = 16;
-		ted->stack = VG_(malloc)("Thread stack", sizeof(ted->stack[0]) * ted->nr_stack_slots_allocated);
-		thread_extra_heads[h] = ted;
-	}
-	if (ted->nr_stack_slots == ted->nr_stack_slots_allocated) {
-		ted->nr_stack_slots_allocated *= 2;
-		ted->stack = VG_(realloc)("Thread stack",
-					  ted->stack,
-					  sizeof(ted->stack[0]) * ted->nr_stack_slots_allocated);
-	}
-	ted->stack[ted->nr_stack_slots] = ret_addr;
-	ted->nr_stack_slots++;
-}
-
-static void
-log_return(unsigned long to, unsigned long rip)
-{
-	ThreadId tid = VG_(get_running_tid)();
-	struct thread_extra_data *ted;
-	unsigned h = tid % NR_THREAD_EXTRA_HEADS;
-	int x;
-
-	for (ted = thread_extra_heads[h];
-	     ted && ted->tid != tid;
-	     ted = ted->next)
-		;
-
-	tl_assert(ted);
-	for (x = ted->nr_stack_slots - 1; x >= 0; x--) {
-		if (ted->stack[x] == to) {
-			if (x != ted->nr_stack_slots - 1)
-				VG_(printf)("Returning to something other than the calling function; did someone call longjmp?\n");
-			ted->nr_stack_slots = x;
-			return;
-		}
-	}
-	VG_(printf)("Returning to somewhere we never came from... (%lx)\n", to);
-	ted->nr_stack_slots = 0;
-}
-
 static IRSB *
 ft_instrument(VgCallbackClosure* closure,
 	      IRSB* bb,
@@ -795,100 +532,7 @@ ft_instrument(VgCallbackClosure* closure,
 	      IRType gWordTy,
 	      IRType hWordTy)
 {
-	IRSB *out = deepCopyIRSBExceptStmts(bb);
-	int x;
-	IRStmt *stmt;
-	unsigned long instr_end;
-	unsigned long instr_start;
-
-	instr_start = 0xdeadbeefbabe;
-	instr_end = 0xf001beefdeadcafe;
-	for (x = 0; x < bb->stmts_used; x++) {
-		stmt = bb->stmts[x];
-		if (stmt->tag != Ist_Store) {
-			addStmtToIRSB(out, stmt);
-		} else {
-			constructLoggingStore(out, stmt->Ist.Store.addr,
-					      stmt->Ist.Store.data,
-					      instr_start);
-		}
-		if (stmt->tag == Ist_IMark) {
-			instr_start = stmt->Ist.IMark.addr;
-			instr_end = stmt->Ist.IMark.addr + stmt->Ist.IMark.len;
-		}
-	}
-
-	if (out->jumpkind == Ijk_Call)
-		add_dirty_call(out,
-			       "log_call",
-			       log_call,
-			       IRExpr_Const(IRConst_U64(instr_end)),
-			       out->next,
-			       NULL);
-	else if (out->jumpkind == Ijk_Ret)
-		add_dirty_call(out,
-			       "log_return",
-			       log_return,
-			       out->next,
-			       IRExpr_Const(IRConst_U64(instr_end)),
-			       NULL);
-	return out;
-}
-
-struct write_file {
-	int fd;
-	unsigned buf_prod;
-	unsigned char buf[1024];
-};
-
-static int
-open_write_file(struct write_file *out, const Char *fname)
-{
-	SysRes sr;
-
-	sr = VG_(open)(tag_table, VKI_O_WRONLY|VKI_O_CREAT|VKI_O_TRUNC, 0600);
-	if (sr.isError)
-		return sr.err;
-	out->fd = sr.res;
-	out->buf_prod = 0;
-	return 0;
-}
-
-static void
-write_file(struct write_file *wf, const void *buf, size_t sz)
-{
-	unsigned to_copy;
-	unsigned x;
-	int y;
-
-	while (sz != 0) {
-		if (wf->buf_prod == sizeof(wf->buf)) {
-			for (x = 0; x < wf->buf_prod; x += y) {
-				y = VG_(write)(wf->fd, wf->buf + x, wf->buf_prod - x);
-				tl_assert(y > 0);
-			}
-			wf->buf_prod = 0;
-		}
-
-		to_copy = sz;
-		if (wf->buf_prod + to_copy >= sizeof(wf->buf))
-			to_copy = sizeof(wf->buf) - wf->buf_prod;
-		VG_(memcpy)(wf->buf + wf->buf_prod, buf, to_copy);
-		wf->buf_prod += to_copy;
-		buf = (void *)((unsigned long)buf + to_copy);
-		sz -= to_copy;
-	}
-}
-
-static void
-close_write_file(struct write_file *wf)
-{
-	int x, y;
-	for (x = 0; x < wf->buf_prod; x+= y) {
-		y = VG_(write)(wf->fd, wf->buf + x, wf->buf_prod - x);
-		tl_assert(y > 0);
-	}
-	VG_(close)(wf->fd);
+	return log_call_return(log_stores(bb));
 }
 
 static void

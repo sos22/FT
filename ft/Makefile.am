@@ -3,7 +3,7 @@ include $(top_srcdir)/Makefile.tool.am
 noinst_PROGRAMS = 
 noinst_PROGRAMS += ft-amd64-linux vgpreload_ft-amd64-linux.so
 
-FT_SOURCES_COMMON = ft_main.c
+FT_SOURCES_COMMON = ft_main.c io.c
 
 ft_amd64_linux_SOURCES      = $(FT_SOURCES_COMMON)
 ft_amd64_linux_CPPFLAGS     = $(AM_CPPFLAGS_AMD64_LINUX)
