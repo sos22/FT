@@ -470,7 +470,7 @@ void* VG_(memcpy) ( void *dest, const void *src, SizeT sz )
 
 void* VG_(memmove)(void *dest, const void *src, SizeT sz)
 {
-   SizeT i;
+   SSizeT i;
    if (sz == 0)
       return dest;
    if (dest < src) {
