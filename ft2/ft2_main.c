@@ -108,7 +108,6 @@ add_address_to_set(struct address_set *set, unsigned long addr)
 				     (set->nr_entries - 1));
 			set->u.entry1N[0] = set->entry0;
 			set->entry0 = addr;
-			set->nr_entries++;
 		} else {
 			/* Binary chop to find the place to insert.
 			   The indexes point at places *between* the
