@@ -3,6 +3,7 @@
 #include "pub_tool_libcbase.h"
 #include "pub_tool_libcassert.h"
 #include "pub_tool_libcprint.h"
+#include "pub_tool_replacemalloc.h"
 #include "pub_tool_mallocfree.h"
 #include "pub_tool_threadstate.h"
 
@@ -21,10 +22,15 @@ struct address_set {
 	} u;
 };
 
+struct addr_set_pair {
+	struct address_set stores;
+	struct address_set loads;
+};
+
 struct addr_hash_entry {
 	struct addr_hash_entry *next;
 	unsigned long addr;
-	struct address_set stores;
+	struct addr_set_pair content;
 };
 
 #define NR_ADDR_HASH_HEADS 8193
@@ -70,7 +76,8 @@ find_addr_hash_entry(unsigned long addr)
 	cursor = VG_(malloc)("addr_hash_entry", sizeof(*cursor));
 	cursor->next = addr_hash_heads[hash];
 	cursor->addr = addr;
-	cursor->stores.nr_entries = 0;
+	cursor->content.stores.nr_entries = 0;
+	cursor->content.loads.nr_entries = 0;
 	addr_hash_heads[hash] = cursor;
 	return cursor;
 }
@@ -221,7 +228,7 @@ static void
 log_store(unsigned long rip, unsigned long addr, unsigned size)
 {
 	struct addr_hash_entry *ahe = find_addr_hash_entry(addr);
-	add_address_to_set(&ahe->stores, rip);
+	add_address_to_set(&ahe->content.stores, rip);
 }
 
 static void
@@ -243,6 +250,127 @@ do_store2(unsigned long addr, unsigned long x1, unsigned long x2,
 	((unsigned long *)addr)[1] = x2;
 }
 
+static void
+do_log_load(unsigned long addr, unsigned long rip, unsigned long rsp)
+{
+	struct addr_hash_entry *ahe;
+	if (addr >= rsp - 128 && addr <= rsp + 8192)
+		return;
+	ahe = find_addr_hash_entry(addr);
+	add_address_to_set(&ahe->content.loads, rip);
+}
+
+static void
+log_this_load(IRSB *irsb, IRExpr *addr, unsigned long rip)
+{
+	IRTemp rsp;
+	if (addr->tag != Iex_RdTmp) {
+		IRTemp t = newIRTemp(irsb->tyenv, Ity_I64);
+		addStmtToIRSB(irsb,
+			      IRStmt_WrTmp(t, addr));
+		addr = IRExpr_RdTmp(t);
+	}
+	rsp = newIRTemp(irsb->tyenv, Ity_I64);
+	addStmtToIRSB(irsb,
+		      IRStmt_WrTmp(rsp, IRExpr_Get(OFFSET_amd64_RSP, Ity_I64)));
+	add_dirty_call(irsb, "log_load", do_log_load, addr,
+		       IRExpr_Const(IRConst_U64(rip)),
+		       IRExpr_RdTmp(rsp),
+		       NULL);
+}
+
+static void
+log_loads_expr(IRSB *irsb, IRExpr *expr, unsigned long rip)
+{
+	switch (expr->tag) {
+	case Iex_Binder:
+		break;
+	case Iex_Get:
+		break;
+	case Iex_GetI:
+		log_loads_expr(irsb, expr->Iex.GetI.ix, rip);
+		break;
+	case Iex_RdTmp:
+		break;
+
+		/* Note fall-through */
+	case Iex_Qop:
+		log_loads_expr(irsb, expr->Iex.Qop.arg4, rip);
+	case Iex_Triop:
+		log_loads_expr(irsb, expr->Iex.Triop.arg3, rip);
+	case Iex_Binop:
+		log_loads_expr(irsb, expr->Iex.Binop.arg2, rip);
+	case Iex_Unop:
+		log_loads_expr(irsb, expr->Iex.Unop.arg, rip);
+		break;
+
+	case Iex_Load:
+		log_loads_expr(irsb, expr->Iex.Load.addr, rip);
+		log_this_load(irsb, expr->Iex.Load.addr, rip);
+		break;
+
+	case Iex_Const:
+		break;
+	case Iex_CCall: {
+		int x;
+		for (x = 0; expr->Iex.CCall.args[x]; x++)
+			log_loads_expr(irsb, expr->Iex.CCall.args[x], rip);
+		break;
+	}
+	case Iex_Mux0X:
+		log_loads_expr(irsb, expr->Iex.Mux0X.cond, rip);
+		log_loads_expr(irsb, expr->Iex.Mux0X.expr0, rip);
+		log_loads_expr(irsb, expr->Iex.Mux0X.exprX, rip);
+		break;
+	}
+}
+
+static IRSB *
+log_loads(IRSB *inp)
+{
+	IRSB *out = deepCopyIRSBExceptStmts(inp);
+	int x;
+	IRStmt *stmt;
+	unsigned long instr_start;
+
+	instr_start = 0xdeadbabebeefface;
+	for (x = 0; x < inp->stmts_used; x++) {
+		stmt = inp->stmts[x];
+		switch (stmt->tag) {
+		case Ist_IMark:
+			instr_start = stmt->Ist.IMark.addr;
+			break;
+		case Ist_Put:
+			log_loads_expr(out, stmt->Ist.Put.data, instr_start);
+			break;
+		case Ist_PutI:
+			log_loads_expr(out, stmt->Ist.PutI.ix, instr_start);
+			log_loads_expr(out, stmt->Ist.PutI.data, instr_start);
+			break;
+		case Ist_WrTmp:
+			log_loads_expr(out, stmt->Ist.WrTmp.data, instr_start);
+			break;
+		case Ist_Store:
+			log_loads_expr(out, stmt->Ist.Store.addr, instr_start);
+			log_loads_expr(out, stmt->Ist.Store.data, instr_start);
+			break;
+		case Ist_Dirty: {
+			int y;
+			log_loads_expr(out, stmt->Ist.Dirty.details->guard, instr_start);
+			for (y = 0; stmt->Ist.Dirty.details->args[y]; y++)
+				log_loads_expr(out, stmt->Ist.Dirty.details->args[y], instr_start);
+			break;
+		}
+		case Ist_Exit:
+			log_loads_expr(out, stmt->Ist.Exit.guard, instr_start);
+			break;
+		default:
+			break;
+		}
+		addStmtToIRSB(out, stmt);
+	}
+	return out;
+}
 
 static void
 ft2_post_clo_init(void)
@@ -258,14 +386,14 @@ ft2_instrument(VgCallbackClosure* closure,
 	       IRType hWordTy)
 {
 	IRSB *b;
-	b = log_stores(bb);
+	b = log_loads(log_stores(bb));
 	return b;
 }
 
 struct set_of_sets_entry {
 	struct set_of_sets_entry *next;
 	unsigned long h;
-	struct address_set content;
+	struct addr_set_pair content;
 };
 
 #define NR_SS_HEADS 32768
@@ -293,6 +421,13 @@ hash_address_set(const struct address_set *s)
 	}
 }
 
+static unsigned long
+hash_addr_set_pair(const struct addr_set_pair *s)
+{
+	return hash_address_set(&s->loads) * 17 +
+		hash_address_set(&s->stores);
+}
+
 static int
 sets_equal(const struct address_set *s1, const struct address_set *s2)
 {
@@ -314,24 +449,44 @@ sets_equal(const struct address_set *s1, const struct address_set *s2)
 	return 1;
 }
 
-/* Add the set @s to the global set of sets. */
-static void
-fold_set_to_global_set(struct address_set *s)
+static int
+set_pairs_equal(const struct addr_set_pair *a, const struct addr_set_pair *b)
 {
-	unsigned long h = hash_address_set(s);
+	return sets_equal(&a->stores, &b->stores) &&
+		sets_equal(&a->loads, &b->loads);
+}
+
+/* Add the set @s to the global set of sets.  Zap it to an empty set
+   at the same time. */
+static void
+fold_set_to_global_set(struct addr_set_pair *s)
+{
+	unsigned long h = hash_addr_set_pair(s);
 	unsigned head = h % NR_SS_HEADS;
 	struct set_of_sets_entry *sse;
 	for (sse = ss_heads[head]; sse; sse = sse->next) {
 		if (sse->h == h &&
-		    sets_equal(s, &sse->content))
+		    set_pairs_equal(s, &sse->content)) {
+			if (s->stores.nr_entries > 2)
+				VG_(free)(s->stores.u.entry1N);
+			s->stores.nr_entries = 0;
+			s->stores.nr_entries_allocated = 0;
+
+			if (s->loads.nr_entries > 2)
+				VG_(free)(s->loads.u.entry1N);
+			s->loads.nr_entries = 0;
+			s->loads.nr_entries_allocated = 0;
 			return;
+		}
 	}
 
 	sse = VG_(malloc)("set_of_sets_entry", sizeof(*sse));
 	sse->h = h;
 	sse->content = *s;
-	s->nr_entries = 0;
-	s->nr_entries_allocated = 0;
+	s->stores.nr_entries = 0;
+	s->stores.nr_entries_allocated = 0;
+	s->loads.nr_entries = 0;
+	s->loads.nr_entries_allocated = 0;
 	sse->next = ss_heads[head];
 	ss_heads[head] = sse;
 }
@@ -346,23 +501,104 @@ ft2_fini(Int exitcode)
 
 	for (x = 0; x < NR_ADDR_HASH_HEADS; x++)
 		for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next)
-			fold_set_to_global_set(&ahe->stores);
+			fold_set_to_global_set(&ahe->content);
 
 	for (x = 0; x < NR_SS_HEADS; x++) {
 		for (sse = ss_heads[x]; sse; sse = sse->next) {
-			VG_(printf)("SSE:");
-			if (sse->content.nr_entries > 0) {
-				VG_(printf)("\t%lx", sse->content.entry0);
-				if (sse->content.nr_entries == 2) {
-					VG_(printf)("\t%lx\n", sse->content.u.entry1);
-				} else {
-					for (y = 0; y < sse->content.nr_entries-1; y++)
-						VG_(printf)("\t%lx", sse->content.u.entry1N[y]);
-					VG_(printf)("\n");
+			if (sse->content.stores.nr_entries > 0 ||
+			    sse->content.loads.nr_entries > 0) {
+				VG_(printf)("SSE:\t{");
+				if (sse->content.loads.nr_entries > 0) {
+					VG_(printf)("%lx", sse->content.loads.entry0);
+					if (sse->content.loads.nr_entries == 2) {
+						VG_(printf)(";%lx", sse->content.loads.u.entry1);
+					} else {
+						for (y = 0; y < sse->content.loads.nr_entries-1; y++)
+							VG_(printf)(";%lx", sse->content.loads.u.entry1N[y]);
+					}
 				}
+				VG_(printf)("}\t[");
+				if (sse->content.stores.nr_entries > 0) {
+					VG_(printf)("%lx", sse->content.stores.entry0);
+					if (sse->content.stores.nr_entries == 2) {
+						VG_(printf)(",%lx", sse->content.stores.u.entry1);
+					} else {
+						for (y = 0; y < sse->content.stores.nr_entries-1; y++)
+							VG_(printf)(",%lx", sse->content.stores.u.entry1N[y]);
+					}
+				}
+				VG_(printf)("]\n");
 			}
 		}
 	}
+}
+
+static void
+refresh_tags(void *base, unsigned long size)
+{
+	unsigned long start = (unsigned long)base & ~7ul;
+	unsigned long end = ((unsigned long)base + size + 7) & ~7ul;
+	unsigned long ptr;
+	struct addr_hash_entry *ahe;
+
+	for (ptr = start; ptr < end; ptr += 8) {
+		ahe = find_addr_hash_entry(ptr);
+		if (ahe)
+			fold_set_to_global_set(&ahe->content);
+	}
+}
+
+static void
+ft2_free(ThreadId tid, void *p)
+{
+	VG_(cli_free)(p);
+}
+
+static void *
+ft2_memalign(ThreadId tid, SizeT align, SizeT n)
+{
+	void *res;
+	if (align < 8)
+		align = 8;
+	n = (n + 7ul) & ~7ul;
+
+	res = VG_(cli_malloc)(align, n);
+	if (res)
+		refresh_tags(res, n);
+	return res;
+}
+
+static void *
+ft2_malloc(ThreadId tid, SizeT n)
+{
+	return ft2_memalign(tid, 0, n);
+}
+
+static void *
+ft2_calloc(ThreadId tid, SizeT nmemb, SizeT size1)
+{
+	void *buf = ft2_malloc(tid, nmemb * size1);
+	if (buf) {
+		VG_(memset)(buf, 0, nmemb * size1);
+		refresh_tags(buf, nmemb * size1);
+	}
+	return buf;
+}
+
+static void *
+ft2_realloc(ThreadId tid, void *p, SizeT new_size)
+{
+	void *n;
+	if (new_size == 0) {
+		ft2_free(tid, p);
+		return NULL;
+	}
+	if (p == NULL)
+		return ft2_malloc(tid, new_size);
+	n = VG_(cli_realloc)(p, new_size);
+	if (n != 0)
+		refresh_tags(n, new_size);
+	return n;
 }
 
 static void
@@ -375,6 +611,17 @@ ft2_pre_clo_init(void)
 	VG_(details_bug_reports_to)(VG_BUGS_TO);
 
 	VG_(basic_tool_funcs)(ft2_post_clo_init, ft2_instrument, ft2_fini);
+
+	VG_(needs_malloc_replacement)(ft2_malloc,
+				      ft2_malloc,
+				      ft2_malloc,
+				      ft2_memalign,
+				      ft2_calloc,
+				      ft2_free,
+				      ft2_free,
+				      ft2_free,
+				      ft2_realloc,
+				      0);
 }
 
 VG_DETERMINE_INTERFACE_VERSION(ft2_pre_clo_init)
