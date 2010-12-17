@@ -10,6 +10,7 @@
 #include "libvex_guest_offsets.h"
 
 #include "../ft/shared.c"
+#include "../ft/io.c"
 
 struct address_set {
 	int nr_entries;
@@ -490,47 +491,60 @@ fold_set_to_global_set(struct addr_set_pair *s)
 	sse->next = ss_heads[head];
 	ss_heads[head] = sse;
 }
+struct hdr {
+	int nr_loads;
+	int nr_stores;
+};
 
 static void
 ft2_fini(Int exitcode)
 {
 	int x;
-	int y;
 	struct addr_hash_entry *ahe;
 	struct set_of_sets_entry *sse;
+	struct write_file output;
 
 	for (x = 0; x < NR_ADDR_HASH_HEADS; x++)
 		for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next)
 			fold_set_to_global_set(&ahe->content);
 
+	open_write_file(&output, "types.dat");
 	for (x = 0; x < NR_SS_HEADS; x++) {
 		for (sse = ss_heads[x]; sse; sse = sse->next) {
 			if (sse->content.stores.nr_entries > 0 ||
 			    sse->content.loads.nr_entries > 0) {
-				VG_(printf)("SSE:\t{");
+				struct hdr hdr;
+				hdr.nr_loads = sse->content.loads.nr_entries;
+				hdr.nr_stores = sse->content.stores.nr_entries;
+				write_file(&output, &hdr, sizeof(hdr));
 				if (sse->content.loads.nr_entries > 0) {
-					VG_(printf)("%lx", sse->content.loads.entry0);
+					write_file(&output, &sse->content.loads.entry0,
+						   sizeof(sse->content.loads.entry0));
 					if (sse->content.loads.nr_entries == 2) {
-						VG_(printf)(";%lx", sse->content.loads.u.entry1);
+						write_file(&output, &sse->content.loads.u.entry1,
+							   sizeof(sse->content.loads.u.entry1));
 					} else {
-						for (y = 0; y < sse->content.loads.nr_entries-1; y++)
-							VG_(printf)(";%lx", sse->content.loads.u.entry1N[y]);
+						write_file(&output, sse->content.loads.u.entry1N,
+							   sizeof(sse->content.loads.u.entry1N[0]) *
+							   (sse->content.loads.nr_entries-1));
 					}
 				}
-				VG_(printf)("}\t[");
 				if (sse->content.stores.nr_entries > 0) {
-					VG_(printf)("%lx", sse->content.stores.entry0);
+					write_file(&output, &sse->content.stores.entry0,
+						   sizeof(sse->content.stores.entry0));
 					if (sse->content.stores.nr_entries == 2) {
-						VG_(printf)(",%lx", sse->content.stores.u.entry1);
+						write_file(&output, &sse->content.stores.u.entry1,
+							   sizeof(sse->content.stores.u.entry1));
 					} else {
-						for (y = 0; y < sse->content.stores.nr_entries-1; y++)
-							VG_(printf)(",%lx", sse->content.stores.u.entry1N[y]);
+						write_file(&output, sse->content.stores.u.entry1N,
+							   sizeof(sse->content.stores.u.entry1N[0]) *
+							   (sse->content.stores.nr_entries-1));
 					}
 				}
-				VG_(printf)("]\n");
 			}
 		}
 	}
+	close_write_file(&output);
 }
 
 static void
