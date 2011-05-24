@@ -14,7 +14,8 @@
 
 struct address_set {
 	int nr_entries;
-	int nr_entries_allocated; /* including entry0.  Only valid if nr_entries >= 3 */
+	int nr_entries_allocated:31; /* including entry0.  Only valid if nr_entries >= 3 */
+	unsigned int loud:1;
 	/* Common case is for there to be <=2 entries in the set, so optimise for that. */
 	unsigned long entry0;
 	union {
@@ -77,6 +78,8 @@ find_addr_hash_entry(unsigned long addr)
 	cursor = VG_(malloc)("addr_hash_entry", sizeof(*cursor));
 	cursor->next = addr_hash_heads[hash];
 	cursor->addr = addr;
+	cursor->content.stores.loud = 0;
+	cursor->content.loads.loud = 0;
 	cursor->content.stores.nr_entries = 0;
 	cursor->content.loads.nr_entries = 0;
 	addr_hash_heads[hash] = cursor;
@@ -84,15 +87,27 @@ find_addr_hash_entry(unsigned long addr)
 }
 
 static void
-add_address_to_set(struct address_set *set, unsigned long addr)
+add_address_to_set(struct address_set *set, unsigned long addr,
+		   const char *sname, unsigned long on_behalf_of)
 {
 	unsigned long t;
 	int low, high;
+	int loud = set->loud;
 
+	if (addr == 0x6060c7 || addr == 0x9a8266 || addr == 0x9a8259)
+		set->loud = loud = 1;
+	if (loud)
+		VG_(printf)("Add address %lx to set %s(%p) on behalf of %lx\n",
+			    addr, sname, set, on_behalf_of);
 	tl_assert(addr != 0);
 	if (set->nr_entries == 0) {
+		if (loud)
+			VG_(printf)("Fresh set\n");
 		set->entry0 = addr;
 	} else if (set->nr_entries == 1) {
+		if (loud)
+			VG_(printf)("Currently size 1 (%lx)\n",
+				    set->entry0);
 		if (addr < set->entry0) {
 			set->u.entry1 = set->entry0;
 			set->entry0 = addr;
@@ -102,6 +117,9 @@ add_address_to_set(struct address_set *set, unsigned long addr)
 			return;
 		}
 	} else if (set->nr_entries == 2) {
+		if (loud)
+			VG_(printf)("Currently size 2 (%lx, %lx)\n",
+				    set->entry0, set->u.entry1);
 		t = set->u.entry1;
 		if (addr == set->entry0 ||
 		    addr == t)
@@ -120,6 +138,8 @@ add_address_to_set(struct address_set *set, unsigned long addr)
 			set->u.entry1N[1] = addr;
 		}
 	} else {
+		if (loud)
+			VG_(printf)("Currently size %d\n", set->nr_entries);
 		if (addr == set->entry0)
 			return;
 		if (addr < set->entry0) {
@@ -229,7 +249,7 @@ static void
 log_store(unsigned long rip, unsigned long addr, unsigned size)
 {
 	struct addr_hash_entry *ahe = find_addr_hash_entry(addr);
-	add_address_to_set(&ahe->content.stores, rip);
+	add_address_to_set(&ahe->content.stores, rip, "store", addr);
 }
 
 static void
@@ -238,6 +258,8 @@ do_store(unsigned long addr, unsigned long data, unsigned long size,
 {
 	if (addr < rsp - 128 || addr >= rsp + 8192)
 		log_store(rip, addr, size);
+	if (addr == 0xe2fba0)
+		VG_(printf)("store %lx -> %lx from %lx\n", data, addr, rip);
 	VG_(memcpy)( (void *)addr, &data, size);
 }
 
@@ -249,6 +271,8 @@ do_store2(unsigned long addr, unsigned long x1, unsigned long x2,
 		log_store(rip, addr, 16);
 	((unsigned long *)addr)[0] = x1;
 	((unsigned long *)addr)[1] = x2;
+	if (addr == 0xe2fba0)
+		VG_(printf)("store2 %lx from %lx\n", addr, rip);
 }
 
 static void
@@ -257,8 +281,10 @@ do_log_load(unsigned long addr, unsigned long rip, unsigned long rsp)
 	struct addr_hash_entry *ahe;
 	if (addr >= rsp - 128 && addr <= rsp + 8192)
 		return;
+	if (addr == 0xe2fba0)
+		VG_(printf)("Load %lx from %lx\n", addr, rip);
 	ahe = find_addr_hash_entry(addr);
-	add_address_to_set(&ahe->content.loads, rip);
+	add_address_to_set(&ahe->content.loads, rip, "load", addr);
 }
 
 static void
@@ -457,6 +483,38 @@ set_pairs_equal(const struct addr_set_pair *a, const struct addr_set_pair *b)
 		sets_equal(&a->loads, &b->loads);
 }
 
+static void
+dump_set(const struct address_set *as)
+{
+	int i;
+	switch (as->nr_entries) {
+	case 0:
+		VG_(printf)("\t\t<empty>\n");
+		break;
+	case 1:
+		VG_(printf)("\t\t0x%lx\n", as->entry0);
+		break;
+	case 2:
+		VG_(printf)("\t\t0x%lx\n", as->entry0);
+		VG_(printf)("\t\t0x%lx\n", as->u.entry1);
+		break;
+	default:
+		VG_(printf)("\t\t0x%lx\n", as->entry0);
+		for (i = 0; i < as->nr_entries - 1; i++)
+			VG_(printf)("\t\t0x%lx\n", as->u.entry1N[i]);
+		break;
+	}
+}
+
+static void
+dump_set_pair(const struct addr_set_pair *s)
+{
+	VG_(printf)("\tStores:\n");
+	dump_set(&s->stores);
+	VG_(printf)("\tLoads:\n");
+	dump_set(&s->loads);
+}
+
 /* Add the set @s to the global set of sets.  Zap it to an empty set
    at the same time. */
 static void
@@ -465,9 +523,18 @@ fold_set_to_global_set(struct addr_set_pair *s)
 	unsigned long h = hash_addr_set_pair(s);
 	unsigned head = h % NR_SS_HEADS;
 	struct set_of_sets_entry *sse;
+	int loud = s->stores.loud | s->loads.loud;
+
+	if (loud) {
+		VG_(printf)("Folding %p to global:\n", s);
+		dump_set_pair(s);
+	}
+
 	for (sse = ss_heads[head]; sse; sse = sse->next) {
 		if (sse->h == h &&
 		    set_pairs_equal(s, &sse->content)) {
+			if (loud)
+				VG_(printf)("Suppress duplicate\n");
 			if (s->stores.nr_entries > 2)
 				VG_(free)(s->stores.u.entry1N);
 			s->stores.nr_entries = 0;
@@ -517,6 +584,12 @@ ft2_fini(Int exitcode)
 
 	for (x = 0; x < NR_SS_HEADS; x++) {
 		for (sse = ss_heads[x]; sse; sse = sse->next) {
+			int loud = sse->content.stores.loud | sse->content.loads.loud;
+			if (loud)
+				VG_(printf)("Writing loud SSE with %d stores and %d loads at %lx\n",
+					    sse->content.stores.nr_entries,
+					    sse->content.loads.nr_entries,
+					    output.offset);
 			if (sse->content.stores.nr_entries > 0 ||
 			    sse->content.loads.nr_entries > 0) {
 				struct hdr hdr;
@@ -550,6 +623,7 @@ ft2_fini(Int exitcode)
 			}
 		}
 	}
+	VG_(printf)("Total file size %lx\n", output.offset);
 	close_write_file(&output);
 }
 

@@ -11,6 +11,7 @@ void close_read_file(struct read_file *rf);
 
 struct write_file {
 	int fd;
+	unsigned long offset;
 	unsigned buf_prod;
 	unsigned char buf[1024];
 };
