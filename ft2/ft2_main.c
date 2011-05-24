@@ -503,12 +503,18 @@ ft2_fini(Int exitcode)
 	struct addr_hash_entry *ahe;
 	struct set_of_sets_entry *sse;
 	struct write_file output;
+	Char buf[128];
 
 	for (x = 0; x < NR_ADDR_HASH_HEADS; x++)
 		for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next)
 			fold_set_to_global_set(&ahe->content);
 
-	open_write_file(&output, "types.dat");
+	x = 0;
+	do {
+		x++;
+		VG_(sprintf)(buf, "types%d.dat", x);
+	} while (open_write_file(&output, buf) != 0);
+
 	for (x = 0; x < NR_SS_HEADS; x++) {
 		for (sse = ss_heads[x]; sse; sse = sse->next) {
 			if (sse->content.stores.nr_entries > 0 ||

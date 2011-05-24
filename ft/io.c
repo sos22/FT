@@ -63,7 +63,7 @@ open_write_file(struct write_file *out, const Char *fname)
 {
 	SysRes sr;
 
-	sr = VG_(open)(fname, VKI_O_WRONLY|VKI_O_CREAT|VKI_O_TRUNC, 0600);
+	sr = VG_(open)(fname, VKI_O_WRONLY|VKI_O_CREAT|VKI_O_EXCL, 0600);
 	if (sr.isError)
 		return sr.err;
 	out->fd = sr.res;
