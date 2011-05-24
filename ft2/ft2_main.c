@@ -34,7 +34,7 @@ struct addr_hash_entry {
 	struct addr_set_pair content;
 };
 
-#define NR_ADDR_HASH_HEADS 8193
+#define NR_ADDR_HASH_HEADS 100271
 static struct addr_hash_entry *
 addr_hash_heads[NR_ADDR_HASH_HEADS];
 
@@ -222,7 +222,7 @@ add_address_to_set(struct address_set *set, unsigned long addr)
 		}
 	}
 	set->nr_entries++;
-	sanity_check_set(set);
+	//sanity_check_set(set);
 }
 
 static void
@@ -554,11 +554,21 @@ refresh_tags(void *base, unsigned long size)
 	unsigned long end = ((unsigned long)base + size + 7) & ~7ul;
 	unsigned long ptr;
 	struct addr_hash_entry *ahe;
+	int x;
 
-	for (ptr = start; ptr < end; ptr += 8) {
-		ahe = find_addr_hash_entry(ptr);
-		if (ahe)
-			fold_set_to_global_set(&ahe->content);
+	if (size >= NR_ADDR_HASH_HEADS * 16) {
+		for (x = 0; x < NR_ADDR_HASH_HEADS; x++) {
+			for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next) {
+				if (ahe->addr >= start && ahe->addr < end)
+					fold_set_to_global_set(&ahe->content);
+			}
+		}
+	} else {
+		for (ptr = start; ptr < end; ptr += 8) {
+			ahe = find_addr_hash_entry(ptr);
+			if (ahe)
+				fold_set_to_global_set(&ahe->content);
+		}
 	}
 }
 
