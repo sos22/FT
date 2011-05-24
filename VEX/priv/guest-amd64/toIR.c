@@ -13771,9 +13771,13 @@ DisResult disInstr_AMD64_WRK (
    /* ------------------------ INT ------------------------ */
 
    case 0xCC: /* INT 3 */
+#if 0
       jmp_lit(Ijk_SigTRAP, guest_RIP_bbstart + delta);
       dres.whatNext = Dis_StopHere;
       DIP("int $0x3\n");
+#else
+      DIP("pseudonop\n");
+#endif
       break;
 
    case 0xCD: { /* INT imm8 */
