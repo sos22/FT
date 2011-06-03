@@ -69,6 +69,7 @@ open_write_file(struct write_file *out, const Char *fname)
 	out->fd = sr.res;
 	out->buf_prod = 0;
 	out->offset = 0;
+	out->written = 0;
 	return 0;
 }
 
@@ -85,6 +86,7 @@ write_file(struct write_file *wf, const void *buf, size_t sz)
 			for (x = 0; x < wf->buf_prod; x += y) {
 				y = VG_(write)(wf->fd, wf->buf + x, wf->buf_prod - x);
 				tl_assert(y > 0);
+				wf->written += y;
 			}
 			wf->buf_prod = 0;
 		}
@@ -106,6 +108,7 @@ close_write_file(struct write_file *wf)
 	for (x = 0; x < wf->buf_prod; x+= y) {
 		y = VG_(write)(wf->fd, wf->buf + x, wf->buf_prod - x);
 		tl_assert(y > 0);
+		wf->written += y;
 	}
 	VG_(close)(wf->fd);
 }

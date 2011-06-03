@@ -586,7 +586,7 @@ ft2_fini(Int exitcode)
 		for (sse = ss_heads[x]; sse; sse = sse->next) {
 			int loud = sse->content.stores.loud | sse->content.loads.loud;
 			if (loud)
-				VG_(printf)("Writing loud SSE with %d stores and %d loads at %lx\n",
+				VG_(printf)("Writing loud SSE with %d stores and %d loads at %ld\n",
 					    sse->content.stores.nr_entries,
 					    sse->content.loads.nr_entries,
 					    output.offset);
@@ -623,8 +623,9 @@ ft2_fini(Int exitcode)
 			}
 		}
 	}
-	VG_(printf)("Total file size %lx\n", output.offset);
+	VG_(printf)("Total file size %ld\n", output.offset);
 	close_write_file(&output);
+	VG_(printf)("Wrote %ld bytes to file\n", output.written);
 }
 
 static void
