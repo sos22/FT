@@ -1667,6 +1667,9 @@ AC_OUTPUT(
    ft2/Makefile
    ft2/tests/Makefile
    ft2/docs/Makefile
+   bcg/Makefile
+   bcg/tests/Makefile
+   bcg/docs/Makefile
    exp-omega/Makefile
    exp-omega/tests/Makefile
    exp-omega/docs/Makefile

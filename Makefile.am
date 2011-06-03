@@ -11,6 +11,7 @@ TOOLS =		memcheck \
 		none \
 		ft \
 		ft2 \
+		bcg \
 		helgrind \
 		drd
 
