@@ -12,15 +12,22 @@
 #include "../ft/shared.c"
 #include "../ft/io.c"
 
+typedef struct {
+	unsigned long addr;
+} rip_t;
+static inline int rip_less_than(rip_t a, rip_t b) { return a.addr < b.addr; }
+static inline int rips_eq(rip_t a, rip_t b) { return a.addr == b.addr; }
+static inline rip_t mk_rip_t(unsigned long x) { rip_t a; a.addr = x; return a; }
+static inline unsigned long rip_hash(rip_t x) { return x.addr; }
+
 struct address_set {
 	int nr_entries;
-	int nr_entries_allocated:31; /* including entry0.  Only valid if nr_entries >= 3 */
-	unsigned int loud:1;
+	int nr_entries_allocated; /* including entry0.  Only valid if nr_entries >= 3 */
 	/* Common case is for there to be <=2 entries in the set, so optimise for that. */
-	unsigned long entry0;
+	rip_t entry0;
 	union {
-		unsigned long entry1;
-		unsigned long *entry1N;
+		rip_t entry1;
+		rip_t *entry1N;
 	} u;
 };
 
@@ -48,13 +55,13 @@ sanity_check_set(const struct address_set *as)
 	if (as->nr_entries <= 1)
 		return;
 	if (as->nr_entries == 2) {
-		tl_assert(as->entry0 < as->u.entry1);
+		tl_assert(rip_less_than(as->entry0, as->u.entry1));
 		return;
 	}
 	tl_assert(as->nr_entries <= as->nr_entries_allocated);
-	tl_assert(as->entry0 < as->u.entry1N[0]);
+	tl_assert(rip_less_than(as->entry0, as->u.entry1N[0]));
 	for (x = 0; x < as->nr_entries-2; x++)
-		tl_assert(as->u.entry1N[x] < as->u.entry1N[x+1]);
+		tl_assert(rip_less_than(as->u.entry1N[x], as->u.entry1N[x+1]));
 }
 
 static unsigned
@@ -78,8 +85,6 @@ find_addr_hash_entry(unsigned long addr)
 	cursor = VG_(malloc)("addr_hash_entry", sizeof(*cursor));
 	cursor->next = addr_hash_heads[hash];
 	cursor->addr = addr;
-	cursor->content.stores.loud = 0;
-	cursor->content.loads.loud = 0;
 	cursor->content.stores.nr_entries = 0;
 	cursor->content.loads.nr_entries = 0;
 	addr_hash_heads[hash] = cursor;
@@ -87,50 +92,37 @@ find_addr_hash_entry(unsigned long addr)
 }
 
 static void
-add_address_to_set(struct address_set *set, unsigned long addr,
+add_address_to_set(struct address_set *set, unsigned long _addr,
 		   const char *sname, unsigned long on_behalf_of)
 {
-	unsigned long t;
+	rip_t t;
 	int low, high;
-	int loud = set->loud;
+	rip_t addr = mk_rip_t(_addr);
 
-	if (addr == 0x6060c7 || addr == 0x9a8266 || addr == 0x9a8259)
-		set->loud = loud = 1;
-	if (loud)
-		VG_(printf)("Add address %lx to set %s(%p) on behalf of %lx\n",
-			    addr, sname, set, on_behalf_of);
-	tl_assert(addr != 0);
+	tl_assert(_addr != 0);
 	if (set->nr_entries == 0) {
-		if (loud)
-			VG_(printf)("Fresh set\n");
 		set->entry0 = addr;
 	} else if (set->nr_entries == 1) {
-		if (loud)
-			VG_(printf)("Currently size 1 (%lx)\n",
-				    set->entry0);
-		if (addr < set->entry0) {
+		if (rip_less_than(addr, set->entry0)) {
 			set->u.entry1 = set->entry0;
 			set->entry0 = addr;
-		} else if (addr > set->entry0) {
+		} else if (rip_less_than(set->entry0, addr)) {
 			set->u.entry1 = addr;
 		} else {
 			return;
 		}
 	} else if (set->nr_entries == 2) {
-		if (loud)
-			VG_(printf)("Currently size 2 (%lx, %lx)\n",
-				    set->entry0, set->u.entry1);
 		t = set->u.entry1;
-		if (addr == set->entry0 ||
-		    addr == t)
+		if (rips_eq(addr, set->entry0) ||
+		    rips_eq(addr, t))
 			return;
 		set->nr_entries_allocated = 16;
 		set->u.entry1N = VG_(malloc)("address set OOL", sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1));
-		if (addr < set->entry0) {
+		if (rip_less_than(addr, set->entry0)) {
 			set->u.entry1N[0] = set->entry0;
 			set->u.entry1N[1] = t;
 			set->entry0 = addr;
-		} else if (addr < t) {
+		} else if (rip_less_than(addr, t)) {
 			set->u.entry1N[0] = addr;
 			set->u.entry1N[1] = t;
 		} else {
@@ -138,11 +130,9 @@ add_address_to_set(struct address_set *set, unsigned long addr,
 			set->u.entry1N[1] = addr;
 		}
 	} else {
-		if (loud)
-			VG_(printf)("Currently size %d\n", set->nr_entries);
-		if (addr == set->entry0)
+		if (rips_eq(addr, set->entry0))
 			return;
-		if (addr < set->entry0) {
+		if (rip_less_than(addr, set->entry0)) {
 			if (set->nr_entries_allocated == set->nr_entries) {
 				set->nr_entries_allocated *= 4;
 				set->u.entry1N = VG_(realloc)("address set OOL",
@@ -216,10 +206,10 @@ add_address_to_set(struct address_set *set, unsigned long addr,
 				    So this will terminate, and will
 				    terminate with the right answer.
 				*/
-				if (addr < set->u.entry1N[probe]) {
+				if (rip_less_than(addr, set->u.entry1N[probe])) {
 					tl_assert(high != probe);
 					high = probe;
-				} else if (addr == set->u.entry1N[probe]) {
+				} else if (rips_eq(addr, set->u.entry1N[probe])) {
 					return;
 				} else {
 					tl_assert(low != probe + 1);
@@ -437,13 +427,13 @@ hash_address_set(const struct address_set *s)
 	case 0:
 		return 0;
 	case 1:
-		return s->entry0;
+		return rip_hash(s->entry0);
 	case 2:
-		return s->entry0 * 4099 + s->u.entry1;
+		return rip_hash(s->entry0) * 4099 + rip_hash(s->u.entry1);
 	default:
-		hash = s->entry0;
+		hash = rip_hash(s->entry0);
 		for (x = 1; x < s->nr_entries; x++)
-			hash = hash * 8191 + s->u.entry1N[x-1];
+			hash = hash * 8191 + rip_hash(s->u.entry1N[x-1]);
 		return hash;
 	}
 }
@@ -464,14 +454,14 @@ sets_equal(const struct address_set *s1, const struct address_set *s2)
 		return 0;
 	if (s1->nr_entries == 0)
 		return 1;
-	if (s1->entry0 != s2->entry0)
+	if (!rips_eq(s1->entry0, s2->entry0))
 		return 0;
 	if (s1->nr_entries == 1)
 		return 1;
 	if (s1->nr_entries == 2)
-		return s1->u.entry1 == s2->u.entry1;
+		return rips_eq(s1->u.entry1, s2->u.entry1);
 	for (x = 0; x < s1->nr_entries - 1; x++)
-		if (s1->u.entry1N[x] != s2->u.entry1N[x])
+		if (!rips_eq(s1->u.entry1N[x], s2->u.entry1N[x]))
 			return 0;
 	return 1;
 }
@@ -523,18 +513,10 @@ fold_set_to_global_set(struct addr_set_pair *s)
 	unsigned long h = hash_addr_set_pair(s);
 	unsigned head = h % NR_SS_HEADS;
 	struct set_of_sets_entry *sse;
-	int loud = s->stores.loud | s->loads.loud;
-
-	if (loud) {
-		VG_(printf)("Folding %p to global:\n", s);
-		dump_set_pair(s);
-	}
 
 	for (sse = ss_heads[head]; sse; sse = sse->next) {
 		if (sse->h == h &&
 		    set_pairs_equal(s, &sse->content)) {
-			if (loud)
-				VG_(printf)("Suppress duplicate\n");
 			if (s->stores.nr_entries > 2)
 				VG_(free)(s->stores.u.entry1N);
 			s->stores.nr_entries = 0;
@@ -584,12 +566,6 @@ ft2_fini(Int exitcode)
 
 	for (x = 0; x < NR_SS_HEADS; x++) {
 		for (sse = ss_heads[x]; sse; sse = sse->next) {
-			int loud = sse->content.stores.loud | sse->content.loads.loud;
-			if (loud)
-				VG_(printf)("Writing loud SSE with %d stores and %d loads at %ld\n",
-					    sse->content.stores.nr_entries,
-					    sse->content.loads.nr_entries,
-					    output.offset);
 			if (sse->content.stores.nr_entries > 0 ||
 			    sse->content.loads.nr_entries > 0) {
 				struct hdr hdr;
