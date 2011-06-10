@@ -78,7 +78,7 @@ bcg_instrument(VgCallbackClosure* closure,
 	       IRType gWordTy,
 	       IRType hWordTy)
 {
-	if (bb->jumpkind == Ijk_Call &&
+	if (bb->jumpkind != Ijk_Ret &&
 	    bb->next->tag != Iex_Const) {
 		IRTemp tmp;
 		unsigned long rip;
