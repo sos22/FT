@@ -17,7 +17,11 @@ typedef struct {
 } rip_t;
 static inline int rip_less_than(rip_t a, rip_t b) { return a.addr < b.addr; }
 static inline int rips_eq(rip_t a, rip_t b) { return a.addr == b.addr; }
-static inline rip_t mk_rip_t(unsigned long x) { rip_t a; a.addr = x; return a; }
+static inline rip_t mk_rip_t(unsigned long x, int private) {
+	rip_t a;
+	a.addr = x | ((unsigned long)!!private << 63);
+	return a;
+}
 static inline unsigned long rip_hash(rip_t x) { return x.addr; }
 
 struct address_set {
@@ -45,6 +49,9 @@ struct addr_hash_entry {
 #define NR_ADDR_HASH_HEADS 100271
 static struct addr_hash_entry *
 addr_hash_heads[NR_ADDR_HASH_HEADS];
+
+static int memory_location_is_private(unsigned long addr);
+static void make_memory_location_public(unsigned long addr);
 
 static void
 sanity_check_set(const struct address_set *as)
@@ -93,11 +100,12 @@ find_addr_hash_entry(unsigned long addr)
 
 static void
 add_address_to_set(struct address_set *set, unsigned long _addr,
-		   const char *sname, unsigned long on_behalf_of)
+		   const char *sname, unsigned long on_behalf_of,
+		   int private)
 {
 	rip_t t;
 	int low, high;
-	rip_t addr = mk_rip_t(_addr);
+	rip_t addr = mk_rip_t(_addr, private);
 
 	tl_assert(_addr != 0);
 	if (set->nr_entries == 0) {
@@ -236,20 +244,22 @@ add_address_to_set(struct address_set *set, unsigned long _addr,
 }
 
 static void
-log_store(unsigned long rip, unsigned long addr, unsigned size)
+log_store(unsigned long rip, unsigned long addr, unsigned size, int private)
 {
 	struct addr_hash_entry *ahe = find_addr_hash_entry(addr);
-	add_address_to_set(&ahe->content.stores, rip, "store", addr);
+	add_address_to_set(&ahe->content.stores, rip, "store", addr, private);
 }
 
 static void
 do_store(unsigned long addr, unsigned long data, unsigned long size,
 	 unsigned long rsp, unsigned long rip)
 {
-	if (addr < rsp - 128 || addr >= rsp + 8192)
-		log_store(rip, addr, size);
-	if (addr == 0xe2fba0)
-		VG_(printf)("store %lx -> %lx from %lx\n", data, addr, rip);
+	int stack = addr >= rsp - 128 && addr < rsp + 8192;
+	int private = stack || memory_location_is_private(addr);
+	if (!stack)
+		log_store(rip, addr, size, private);
+	if (size == 8 && !private)
+		make_memory_location_public(data);
 	VG_(memcpy)( (void *)addr, &data, size);
 }
 
@@ -258,11 +268,9 @@ do_store2(unsigned long addr, unsigned long x1, unsigned long x2,
 	  unsigned long rsp, unsigned long rip)
 {
 	if (addr < rsp - 128 || addr >= rsp + 8192)
-		log_store(rip, addr, 16);
+		log_store(rip, addr, 16, memory_location_is_private(addr));
 	((unsigned long *)addr)[0] = x1;
 	((unsigned long *)addr)[1] = x2;
-	if (addr == 0xe2fba0)
-		VG_(printf)("store2 %lx from %lx\n", addr, rip);
 }
 
 static void
@@ -271,10 +279,8 @@ do_log_load(unsigned long addr, unsigned long rip, unsigned long rsp)
 	struct addr_hash_entry *ahe;
 	if (addr >= rsp - 128 && addr <= rsp + 8192)
 		return;
-	if (addr == 0xe2fba0)
-		VG_(printf)("Load %lx from %lx\n", addr, rip);
 	ahe = find_addr_hash_entry(addr);
-	add_address_to_set(&ahe->content.loads, rip, "load", addr);
+	add_address_to_set(&ahe->content.loads, rip, "load", addr, memory_location_is_private(addr));
 }
 
 static void
@@ -482,16 +488,16 @@ dump_set(const struct address_set *as)
 		VG_(printf)("\t\t<empty>\n");
 		break;
 	case 1:
-		VG_(printf)("\t\t0x%lx\n", as->entry0);
+		VG_(printf)("\t\t0x%lx\n", as->entry0.addr);
 		break;
 	case 2:
-		VG_(printf)("\t\t0x%lx\n", as->entry0);
-		VG_(printf)("\t\t0x%lx\n", as->u.entry1);
+		VG_(printf)("\t\t0x%lx\n", as->entry0.addr);
+		VG_(printf)("\t\t0x%lx\n", as->u.entry1.addr);
 		break;
 	default:
-		VG_(printf)("\t\t0x%lx\n", as->entry0);
+		VG_(printf)("\t\t0x%lx\n", as->entry0.addr);
 		for (i = 0; i < as->nr_entries - 1; i++)
-			VG_(printf)("\t\t0x%lx\n", as->u.entry1N[i]);
+			VG_(printf)("\t\t0x%lx\n", as->u.entry1N[i].addr);
 		break;
 	}
 }
@@ -629,10 +635,188 @@ refresh_tags(void *base, unsigned long size)
 	}
 }
 
+struct memory_tree_entry {
+	int private;
+	unsigned long start;
+	unsigned long end;
+	struct memory_tree_entry *prev;
+	struct memory_tree_entry *next;
+};
+
+static struct memory_tree_entry *memory_root;
+
+static void
+_sanity_check_memory_tree(unsigned long start, unsigned long end, const struct memory_tree_entry *mte)
+{
+	if (!mte)
+		return;
+	tl_assert(start <= mte->start);
+	tl_assert(end >= mte->end);
+	tl_assert(mte->start < mte->end);
+	tl_assert(mte->private == 0 || mte->private == 1);
+	if (mte->prev)
+		_sanity_check_memory_tree(start, mte->start, mte->prev);
+	if (mte->next)
+		_sanity_check_memory_tree(mte->end, end, mte->next);
+}
+static void
+sanity_check_memory_tree(void)
+{
+	_sanity_check_memory_tree(0, ~0ul, memory_root);
+}
+
+static struct memory_tree_entry *
+new_memory_tree_entry(unsigned long start, unsigned long end)
+{
+	struct memory_tree_entry *mte = VG_(malloc)("mte_entry", sizeof(*mte));
+	mte->private = 1;
+	mte->start = start;
+	mte->end = end;
+	mte->prev = NULL;
+	mte->next = NULL;
+	return mte;
+}
+
+static void
+release_memory_tree_entry(struct memory_tree_entry *mte)
+{
+	VG_(free)(mte);
+}
+
+static void
+set_memory_private(unsigned long start, unsigned long end)
+{
+	struct memory_tree_entry *mte;
+	struct memory_tree_entry **mtep;
+
+	VG_(printf)("Create MTE (%lx, %lx)\n", start, end);
+	sanity_check_memory_tree();
+
+	mtep = &memory_root;
+	while (*mtep) {
+		mte = *mtep;
+		if (end <= mte->start) {
+			mtep = &mte->prev;
+			continue;
+		}
+		if (start >= mte->end) {
+			mtep = &mte->next;
+			continue;
+		}
+		VG_(printf)("Huh? Creating memory region [%lx,%lx), but found [%lx,%lx) already existing\n",
+			    start, end, mte->start, mte->end);
+		tl_assert(0);
+	}
+	*mtep = new_memory_tree_entry(start, end);
+	sanity_check_memory_tree();
+	return;
+}
+
+static void
+release_memory_range(unsigned long start, unsigned long end)
+{
+	struct memory_tree_entry *mte;
+	struct memory_tree_entry *cursor;
+	struct memory_tree_entry **mtep;
+
+	VG_(printf)("Release MTE (%lx, %lx)\n", start, end);
+	sanity_check_memory_tree();
+	mtep = &memory_root;
+	while (1) {
+		mte = *mtep;
+		if (!mte) {
+			VG_(printf)("Failed to locate memory entry for (%lx,%lx)\n", start, end);
+		}
+		tl_assert(mte);
+		if (mte->start == start || mte->end == end) {
+			tl_assert(start == mte->start);
+			tl_assert(end == mte->end);
+			if (mte->prev) {
+				if (mte->next) {
+					if (!mte->prev->next) {
+						mte->prev->next = mte->next;
+						*mtep = mte->prev;
+					} else if (!mte->next->prev) {
+						mte->next->prev = mte->prev;
+						*mtep = mte->next;
+					} else {
+						for (cursor = mte->prev;
+						     cursor->next;
+						     cursor = cursor->next)
+							;
+						cursor->next = mte->next;
+						*mtep = mte->prev;
+					}
+				} else {
+					*mtep = mte->prev;
+				}
+			} else {
+				if (mte->next) {
+					*mtep = mte->next;
+				} else {
+					*mtep = NULL;
+				}
+			}
+			release_memory_tree_entry(mte);
+			break;
+		}
+		if (end <= mte->start) {
+			mtep = &mte->prev;
+			continue;
+		}
+		if (start >= mte->end) {
+			mtep = &mte->next;
+			continue;
+		}
+		VG_(printf)("Huh? Removing [%lx,%lx), found [%lx,%lx)\n",
+			    start, end, mte->start, mte->end);
+		tl_assert(0);
+	}
+	sanity_check_memory_tree();
+}
+
+static int
+memory_location_is_private(unsigned long addr)
+{
+	struct memory_tree_entry *mte;
+
+	for (mte = memory_root; mte; ) {
+		if (addr < mte->start)
+			mte = mte->prev;
+		else if (addr >= mte->end)
+			mte = mte->next;
+		else
+			return mte->private;
+	}
+	return 0;
+}
+
+static void
+make_memory_location_public(unsigned long addr)
+{
+	struct memory_tree_entry *mte;
+
+	for (mte = memory_root; mte; ) {
+		if (addr < mte->start)
+			mte = mte->prev;
+		else if (addr >= mte->end)
+			mte = mte->next;
+		else {
+			mte->private = 0;
+			return;
+		}
+	}
+}
+
 static void
 ft2_free(ThreadId tid, void *p)
 {
-	VG_(cli_free)(p);
+	if (p) {
+		unsigned long start = (unsigned long)p - 8;
+		unsigned long sz = *(unsigned long *)start;
+		release_memory_range(start, start + sz);
+		VG_(cli_free)((void *)start);
+	}
 }
 
 static void *
@@ -641,12 +825,18 @@ ft2_memalign(ThreadId tid, SizeT align, SizeT n)
 	void *res;
 	if (align < 8)
 		align = 8;
+	n += 8;
 	n = (n + 7ul) & ~7ul;
 
 	res = VG_(cli_malloc)(align, n);
-	if (res)
+	if (res) {
 		refresh_tags(res, n);
-	return res;
+		*(unsigned long *)res = n;
+		set_memory_private((unsigned long)res, (unsigned long)res + n);
+		return (void *)((unsigned long)res + 8);
+	} else {
+		return NULL;
+	}
 }
 
 static void *
@@ -670,15 +860,21 @@ static void *
 ft2_realloc(ThreadId tid, void *p, SizeT new_size)
 {
 	void *n;
+	unsigned long old_size;
+
 	if (new_size == 0) {
 		ft2_free(tid, p);
 		return NULL;
 	}
 	if (p == NULL)
 		return ft2_malloc(tid, new_size);
-	n = VG_(cli_realloc)(p, new_size);
-	if (n != 0)
-		refresh_tags(n, new_size);
+	n = ft2_malloc(tid, new_size);
+	old_size = ((unsigned long *)p)[-1];
+	if (old_size < new_size)
+		VG_(memcpy)(n, p, old_size);
+	else
+		VG_(memcpy)(n, p, new_size);
+	ft2_free(tid, p);
 	return n;
 }
 
