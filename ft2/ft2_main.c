@@ -662,7 +662,7 @@ _sanity_check_memory_tree(unsigned long start, unsigned long end, const struct m
 static void
 sanity_check_memory_tree(void)
 {
-	_sanity_check_memory_tree(0, ~0ul, memory_root);
+	//_sanity_check_memory_tree(0, ~0ul, memory_root);
 }
 
 static struct memory_tree_entry *
@@ -778,15 +778,79 @@ release_memory_range(unsigned long start, unsigned long end)
 static int
 memory_location_is_private(unsigned long addr)
 {
-	struct memory_tree_entry *mte;
+	struct memory_tree_entry *mte, **mtep;
+	struct memory_tree_entry *r, *rp, *rpp, *rpps, *rps, *rpsp,
+		*rpss, *rs, *rsp, *rss, *rspp, *rsps, *rssp;
 
-	for (mte = memory_root; mte; ) {
-		if (addr < mte->start)
-			mte = mte->prev;
-		else if (addr >= mte->end)
-			mte = mte->next;
-		else
+	mtep = &memory_root;
+	while (1) {
+		mte = *mtep;
+		if (!mte)
+			return 0;
+		if (addr >= mte->start && addr < mte->end)
 			return mte->private;
+		/* Splay */
+		r = mte;
+		if (addr < mte->start) {
+			rp = r->prev;
+			if (!rp)
+				return 0;
+			rpp = rp->prev;
+			rps = rp->next;
+			if (addr < rp->start) {
+				if (!rpp)
+					return 0;
+				rpps = rpp->next;
+				*mtep = rpp;
+				rpp->next = r;
+				rp->prev = rpps;
+			} else if (addr < rp->end) {
+				*mtep = rp;
+				rp->next = r;
+				r->prev = rps;
+			} else {
+				if (!rps)
+					return 0;
+				rpss = rps->next;
+				rpsp = rps->prev;
+				*mtep = rps;
+				rps->next = r;
+				r->prev = rpss;
+				rps->prev = rp;
+				rp->next = rpsp;
+			}
+		} else {
+			tl_assert(addr >= mte->end);
+			rs = r->next;
+			if (!rs)
+				return 0;
+			rsp = rs->prev;
+			rss = rs->next;
+			if (addr < rs->start) {
+				if (!rsp)
+					return 0;
+				rspp = rsp->prev;
+				rsps = rsp->next;
+				*mtep = rsp;
+				rsp->prev = r;
+				r->next = rspp;
+				rsp->next = rs;
+				rs->prev = rsps;
+			} else if (addr < rs->end) {
+				*mtep = rs;
+				r->next = rsp;
+				rs->prev = r;
+			} else {
+				if (!rss)
+					return 0;
+				rssp = rss->prev;
+				*mtep = rss;
+				rs->prev = r;
+				r->next = rsp;
+				rss->prev = rs;
+				rs->next = rssp;
+			}
+		}
 	}
 	return 0;
 }
