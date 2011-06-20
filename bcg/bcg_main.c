@@ -30,7 +30,7 @@ hash_address(unsigned long addr)
 }
 
 static void
-log_call(unsigned long caller, unsigned long callee)
+log_call(unsigned long caller, unsigned long is_call, unsigned long callee)
 {
 	unsigned h = hash_address(caller);
 	struct hash_entry *he;
@@ -61,7 +61,7 @@ log_call(unsigned long caller, unsigned long callee)
 		VG_(free)(he->entries);
 		he->entries = t;
 	}
-	he->entries[he->nr_entries] = callee;
+	he->entries[he->nr_entries] = callee | (is_call << 63);
 	he->nr_entries++;
 }
 
@@ -105,8 +105,9 @@ bcg_instrument(VgCallbackClosure* closure,
 					      0,
 					      "log_call",
 					      log_call,
-					      mkIRExprVec_2(
+					      mkIRExprVec_3(
 						      IRExpr_Const(IRConst_U64(rip)),
+						      IRExpr_Const(IRConst_U64(bb->jumpkind == Ijk_Call)),
 						      bb->next))));
 	}
 	return bb;
