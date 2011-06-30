@@ -9,7 +9,6 @@ TOOLS =		memcheck \
 		massif \
 		lackey \
 		none \
-		ft \
 		ft2 \
 		bcg \
 		helgrind \
