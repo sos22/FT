@@ -15,9 +15,9 @@ static struct thread_extra_data *
 thread_extra_heads[NR_THREAD_EXTRA_HEADS];
 
 static void do_store(unsigned long addr, unsigned long data, unsigned long size,
-		     unsigned long rsp, unsigned long rip);
+		     unsigned long rip);
 static void do_store2(unsigned long addr, unsigned long x1, unsigned long x2,
-		      unsigned long rsp, unsigned long rip);
+		      unsigned long rip);
 
 static IRTemp
 cast_to_U64(IRSB *irsb, IRExpr *expr)
@@ -105,12 +105,7 @@ constructLoggingStore(IRSB *irsb,
 	IRType t = typeOfIRExpr(irsb->tyenv, data);
 	IRTemp tmp1, tmp2;
 	int is_vector = 0;
-	IRTemp rsp;
 
-	rsp = newIRTemp(irsb->tyenv, Ity_I64);
-	addStmtToIRSB(irsb,
-		      IRStmt_WrTmp(rsp,
-				   IRExpr_Get(OFFSET_amd64_RSP, Ity_I64)));
 	switch (t) {
 	case Ity_I8:
 	case Ity_I16:
@@ -124,7 +119,6 @@ constructLoggingStore(IRSB *irsb,
 			       addr,
 			       IRExpr_RdTmp(tmp1),
 			       IRExpr_Const(IRConst_U64(sizeofIRType(t))),
-			       IRExpr_RdTmp(rsp),
 			       IRExpr_Const(IRConst_U64(rip)),
 			       NULL);
 		break;
@@ -135,7 +129,6 @@ constructLoggingStore(IRSB *irsb,
 			       addr,
 			       data,
 			       IRExpr_Const(IRConst_U64(8)),
-			       IRExpr_RdTmp(rsp),
 			       IRExpr_Const(IRConst_U64(rip)),
 			       NULL);
 		break;
@@ -164,7 +157,6 @@ constructLoggingStore(IRSB *irsb,
 			       addr,
 			       IRExpr_RdTmp(tmp1),
 			       IRExpr_RdTmp(tmp2),
-			       IRExpr_RdTmp(rsp),
 			       IRExpr_Const(IRConst_U64(rip)),
 			       NULL);
 		break;

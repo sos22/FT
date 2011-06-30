@@ -9,6 +9,8 @@
 
 #include "libvex_guest_offsets.h"
 
+#define PAGE_SIZE (4096ul)
+
 #include "../ft/shared.c"
 #include "../ft/io.c"
 
@@ -250,11 +252,32 @@ log_store(unsigned long rip, unsigned long addr, unsigned size, int private)
 	add_address_to_set(&ahe->content.stores, rip, "store", addr, private);
 }
 
-static void
-do_store(unsigned long addr, unsigned long data, unsigned long size,
-	 unsigned long rsp, unsigned long rip)
+struct stack_data {
+	unsigned long start;
+	unsigned long end;
+};
+
+static struct stack_data *
+get_current_thread_stack_data(void)
 {
-	int stack = addr >= rsp - 128 && addr < rsp + 8192;
+	static struct stack_data sd[VG_N_THREADS];
+	return &sd[VG_(get_running_tid)()];
+}
+
+static int
+is_stack(unsigned long addr)
+{
+	struct stack_data *sd = get_current_thread_stack_data();
+	if (addr >= sd->start && addr <= sd->end)
+		return 1;
+	else
+		return 0;
+}
+
+static void
+do_store(unsigned long addr, unsigned long data, unsigned long size, unsigned long rip)
+{
+	int stack = is_stack(addr);
 	int private = stack || memory_location_is_private(addr);
 	if (!stack)
 		log_store(rip, addr, size, private);
@@ -264,20 +287,19 @@ do_store(unsigned long addr, unsigned long data, unsigned long size,
 }
 
 static void
-do_store2(unsigned long addr, unsigned long x1, unsigned long x2,
-	  unsigned long rsp, unsigned long rip)
+do_store2(unsigned long addr, unsigned long x1, unsigned long x2, unsigned long rip)
 {
-	if (addr < rsp - 128 || addr >= rsp + 8192)
+	if (!is_stack(addr))
 		log_store(rip, addr, 16, memory_location_is_private(addr));
 	((unsigned long *)addr)[0] = x1;
 	((unsigned long *)addr)[1] = x2;
 }
 
 static void
-do_log_load(unsigned long addr, unsigned long rip, unsigned long rsp)
+do_log_load(unsigned long addr, unsigned long rip)
 {
 	struct addr_hash_entry *ahe;
-	if (addr >= rsp - 128 && addr <= rsp + 8192)
+	if (is_stack(addr))
 		return;
 	ahe = find_addr_hash_entry(addr);
 	add_address_to_set(&ahe->content.loads, rip, "load", addr, memory_location_is_private(addr));
@@ -286,19 +308,14 @@ do_log_load(unsigned long addr, unsigned long rip, unsigned long rsp)
 static void
 log_this_load(IRSB *irsb, IRExpr *addr, unsigned long rip)
 {
-	IRTemp rsp;
 	if (addr->tag != Iex_RdTmp) {
 		IRTemp t = newIRTemp(irsb->tyenv, Ity_I64);
 		addStmtToIRSB(irsb,
 			      IRStmt_WrTmp(t, addr));
 		addr = IRExpr_RdTmp(t);
 	}
-	rsp = newIRTemp(irsb->tyenv, Ity_I64);
-	addStmtToIRSB(irsb,
-		      IRStmt_WrTmp(rsp, IRExpr_Get(OFFSET_amd64_RSP, Ity_I64)));
 	add_dirty_call(irsb, "log_load", do_log_load, addr,
 		       IRExpr_Const(IRConst_U64(rip)),
-		       IRExpr_RdTmp(rsp),
 		       NULL);
 }
 
@@ -348,6 +365,47 @@ log_loads_expr(IRSB *irsb, IRExpr *expr, unsigned long rip)
 	}
 }
 
+static void
+do_log_change_rsp(unsigned long old, unsigned long new)
+{
+	struct stack_data *sd = get_current_thread_stack_data();
+	unsigned long new_round_up = (new + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+	if (old - new >= 4ul << 20 && new - old >= 4ul << 20) {
+		/* Arbitrarily decree that moving the stack more than
+		   4MiB in one go indicates that you're switching to a
+		   new stack. */
+		VG_(printf)("Thread %d switched stacks (%lx -> %lx)\n",
+			    VG_(get_running_tid)(), old, new);
+		sd->start = new - 128;
+		sd->end = new_round_up;
+		return;
+	}
+
+	sd->start = new - 128;
+	if (sd->end < new_round_up)
+		sd->end = new_round_up;
+}
+
+static void
+log_change_rsp(IRSB *irsb, IRExpr *new_value)
+{
+	IRTemp old_rsp_tmp = newIRTemp(irsb->tyenv, Ity_I64);
+	addStmtToIRSB(irsb,
+		      IRStmt_WrTmp(old_rsp_tmp,
+				   IRExpr_Get(OFFSET_amd64_RSP, Ity_I64)));
+	if (new_value->tag != Iex_RdTmp) {
+		IRTemp t = newIRTemp(irsb->tyenv, Ity_I64);
+		addStmtToIRSB(irsb,
+			      IRStmt_WrTmp(t, new_value));
+		new_value = IRExpr_RdTmp(t);
+	}
+	add_dirty_call(irsb, "log_change_rsp", do_log_change_rsp,
+		       IRExpr_RdTmp(old_rsp_tmp),
+		       new_value,
+		       NULL);
+}
+
 static IRSB *
 log_loads(IRSB *inp)
 {
@@ -365,6 +423,8 @@ log_loads(IRSB *inp)
 			break;
 		case Ist_Put:
 			log_loads_expr(out, stmt->Ist.Put.data, instr_start);
+			if (stmt->Ist.Put.offset == OFFSET_amd64_RSP)
+				log_change_rsp(out, stmt->Ist.Put.data);
 			break;
 		case Ist_PutI:
 			log_loads_expr(out, stmt->Ist.PutI.ix, instr_start);
