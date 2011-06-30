@@ -12,6 +12,9 @@
 /* Define to 1 if you're using glibc 2.10.x */
 #undef GLIBC_2_10
 
+/* Define to 1 if you're using glibc 2.11.x */
+#undef GLIBC_2_11
+
 /* Define to 1 if you're using glibc 2.2.x */
 #undef GLIBC_2_2
 
@@ -181,6 +184,9 @@
 
 /* Define to 1 if you have the <sys/klog.h> header file. */
 #undef HAVE_SYS_KLOG_H
+
+/* Define to 1 if you have the <sys/param.h> header file. */
+#undef HAVE_SYS_PARAM_H
 
 /* Define to 1 if you have the <sys/poll.h> header file. */
 #undef HAVE_SYS_POLL_H
