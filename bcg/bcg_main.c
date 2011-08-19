@@ -49,6 +49,7 @@ log_call(unsigned long caller, unsigned long is_call, unsigned long callee)
 		hash_heads[h] = he;
 	}
 
+	callee |= (is_call << 63);
 	for (i = 0; i < he->nr_entries; i++)
 		if (he->entries[i] == callee)
 			return;
@@ -61,7 +62,7 @@ log_call(unsigned long caller, unsigned long is_call, unsigned long callee)
 		VG_(free)(he->entries);
 		he->entries = t;
 	}
-	he->entries[he->nr_entries] = callee | (is_call << 63);
+	he->entries[he->nr_entries] = callee;
 	he->nr_entries++;
 }
 

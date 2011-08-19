@@ -9,6 +9,8 @@
 
 #include "libvex_guest_offsets.h"
 
+#include "valgrind.h"
+
 #define PAGE_SIZE (4096ul)
 
 #include "../ft/shared.c"
@@ -1002,6 +1004,20 @@ ft2_realloc(ThreadId tid, void *p, SizeT new_size)
 	return n;
 }
 
+static Bool
+ft2_client_request(ThreadId tid, UWord *arg_block, UWord *ret)
+{
+	*ret = 0;
+	if (VG_IS_TOOL_USERREQ('F', 'T', arg_block[0]) &&
+	    arg_block[0] == VG_USERREQ_TOOL_BASE('F', 'T')) {
+		refresh_tags((void *)arg_block[1],
+			     arg_block[2]);
+		return True;
+	} else {
+		return False;
+	}
+}
+
 static void
 ft2_pre_clo_init(void)
 {
@@ -1023,6 +1039,7 @@ ft2_pre_clo_init(void)
 				      ft2_free,
 				      ft2_realloc,
 				      0);
+	VG_(needs_client_requests)(ft2_client_request);
 }
 
 VG_DETERMINE_INTERFACE_VERSION(ft2_pre_clo_init)
