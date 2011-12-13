@@ -16,6 +16,8 @@
 #include "../ft/shared.c"
 #include "../ft/io.c"
 
+static int i_am_multithreaded;
+
 typedef struct {
 	unsigned long addr;
 } rip_t;
@@ -751,7 +753,6 @@ set_memory_private(unsigned long start, unsigned long end)
 	struct memory_tree_entry *mte;
 	struct memory_tree_entry **mtep;
 
-	VG_(printf)("Create MTE (%lx, %lx)\n", start, end);
 	sanity_check_memory_tree();
 
 	mtep = &memory_root;
@@ -781,7 +782,6 @@ release_memory_range(unsigned long start, unsigned long end)
 	struct memory_tree_entry *cursor;
 	struct memory_tree_entry **mtep;
 
-	VG_(printf)("Release MTE (%lx, %lx)\n", start, end);
 	sanity_check_memory_tree();
 	mtep = &memory_root;
 	while (1) {
@@ -843,6 +843,12 @@ memory_location_is_private(unsigned long addr)
 	struct memory_tree_entry *mte, **mtep;
 	struct memory_tree_entry *r, *rp, *rpp, *rpps, *rps, *rpsp,
 		*rpss, *rs, *rsp, *rss, *rspp, *rsps, *rssp;
+
+	/* If we're not multithreaded then we consider all memory
+	   locations to be private.  We still need to do all the rest
+	   of the machinery, though, so that type tracking works. */
+	if (!i_am_multithreaded)
+		return 1;
 
 	mtep = &memory_root;
 	while (1) {
@@ -1019,6 +1025,14 @@ ft2_client_request(ThreadId tid, UWord *arg_block, UWord *ret)
 }
 
 static void
+ft2_create_thread(ThreadId tid, ThreadId child)
+{
+	if (tid == VG_INVALID_THREADID)
+		return;
+	i_am_multithreaded = 1;
+}
+
+static void
 ft2_pre_clo_init(void)
 {
 	VG_(details_name)("FT2");
@@ -1028,6 +1042,8 @@ ft2_pre_clo_init(void)
 	VG_(details_bug_reports_to)(VG_BUGS_TO);
 
 	VG_(basic_tool_funcs)(ft2_post_clo_init, ft2_instrument, ft2_fini);
+
+	VG_(track_pre_thread_ll_create)(ft2_create_thread);
 
 	VG_(needs_malloc_replacement)(ft2_malloc,
 				      ft2_malloc,
