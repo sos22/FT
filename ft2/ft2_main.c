@@ -15,20 +15,11 @@
 
 #include "../ft/shared.c"
 #include "../ft/io.c"
+#include "../ft/rips.c"
 
 static int i_am_multithreaded;
 
-typedef struct {
-	unsigned long addr;
-} rip_t;
-static inline int rip_less_than(rip_t a, rip_t b) { return a.addr < b.addr; }
-static inline int rips_eq(rip_t a, rip_t b) { return a.addr == b.addr; }
-static inline rip_t mk_rip_t(unsigned long x, int private) {
-	rip_t a;
-	a.addr = x | ((unsigned long)!!private << 63);
-	return a;
-}
-static inline unsigned long rip_hash(rip_t x) { return x.addr; }
+typedef struct rip_entry rip_t;
 
 struct address_set {
 	int nr_entries;
@@ -59,22 +50,59 @@ addr_hash_heads[NR_ADDR_HASH_HEADS];
 static int memory_location_is_private(unsigned long addr);
 static void make_memory_location_public(unsigned long addr);
 
+static int
+rip_less_than(const struct rip_entry *re1, unsigned long rip1,
+	      const struct rip_entry *re2, unsigned long rip2)
+{
+	int idx1, idx2;
+	unsigned long entry1, entry2;
+	if (rip1 < rip2)
+		return 1;
+	if (rip1 > rip2)
+		return 0;
+
+	idx1 = re1->nr_entries - 1;
+	idx2 = re2->nr_entries - 1;
+	while (idx1 >= 0 && idx2 >= 0) {
+		entry1 = get_re_entry(re1, idx1);
+		entry2 = get_re_entry(re2, idx2);
+		if (entry1 < entry2)
+			return 1;
+		if (entry1 > entry2)
+			return 0;
+		idx1 = next_re_idx(re1, entry1);
+		idx2 = next_re_idx(re2, entry2);
+	}
+	if (idx2 >= 0)
+		return 1;
+	return 0;
+}
+
 static void
 sanity_check_set(const struct address_set *as)
 {
-	int x;
+       int x;
 
-	tl_assert(as->nr_entries >= 0);
-	if (as->nr_entries <= 1)
-		return;
-	if (as->nr_entries == 2) {
-		tl_assert(rip_less_than(as->entry0, as->u.entry1));
-		return;
-	}
-	tl_assert(as->nr_entries <= as->nr_entries_allocated);
-	tl_assert(rip_less_than(as->entry0, as->u.entry1N[0]));
-	for (x = 0; x < as->nr_entries-2; x++)
-		tl_assert(rip_less_than(as->u.entry1N[x], as->u.entry1N[x+1]));
+       tl_assert(as->nr_entries >= 0);
+       if (as->nr_entries == 0)
+	       return;
+       sanity_check_rip(&as->entry0);
+       if (as->nr_entries == 1)
+               return;
+       if (as->nr_entries == 2) {
+	       sanity_check_rip(&as->u.entry1);
+	       tl_assert(rip_less_than(&as->entry0, as->entry0.rip, &as->u.entry1, as->u.entry1.rip));
+               return;
+       }
+       tl_assert(as->nr_entries <= as->nr_entries_allocated);
+       tl_assert(rip_less_than(&as->entry0, as->entry0.rip, &as->u.entry1N[0], as->u.entry1N[0].rip));
+       sanity_check_rip(&as->u.entry1N[0]);
+       for (x = 0; x < as->nr_entries-2; x++) {
+	       sanity_check_rip(&as->u.entry1N[x]);
+	       sanity_check_rip(&as->u.entry1N[x+1]);
+               tl_assert(rip_less_than(&as->u.entry1N[x], as->u.entry1N[x].rip,
+				       &as->u.entry1N[x+1], as->u.entry1N[x+1].rip));
+       }
 }
 
 static unsigned
@@ -105,48 +133,61 @@ find_addr_hash_entry(unsigned long addr)
 }
 
 static void
-add_address_to_set(struct address_set *set, unsigned long _addr,
-		   const char *sname, unsigned long on_behalf_of,
-		   int private)
+sanity_check_addr_hash(void)
 {
-	rip_t t;
-	int low, high;
-	rip_t addr = mk_rip_t(_addr, private);
+	unsigned x;
+	struct addr_hash_entry *cursor;
+	for (x = 0; x < NR_ADDR_HASH_HEADS; x++)
+		for (cursor = addr_hash_heads[x]; cursor; cursor = cursor->next) {
+			sanity_check_set(&cursor->content.stores);
+			sanity_check_set(&cursor->content.loads);
+		}
+}
 
+static void
+add_address_to_set(struct address_set *set, unsigned long _addr, int private)
+{
+	struct rip_entry *currentStack = &thread_callstacks[VG_(get_running_tid)()];
+	int low, high;
+	unsigned long addr = private ? _addr : _addr | (1ul << 63);
+	struct rip_entry *ool;
+
+	sanity_check_set(set);
 	tl_assert(_addr != 0);
 	if (set->nr_entries == 0) {
-		set->entry0 = addr;
+		copy_rip_entry(&set->entry0, currentStack, addr);
 	} else if (set->nr_entries == 1) {
-		if (rip_less_than(addr, set->entry0)) {
+		if (rip_less_than(currentStack, addr, &set->entry0, set->entry0.rip)) {
 			set->u.entry1 = set->entry0;
-			set->entry0 = addr;
-		} else if (rip_less_than(set->entry0, addr)) {
-			set->u.entry1 = addr;
+			copy_rip_entry(&set->entry0, currentStack, addr);
+		} else if (rip_less_than(&set->entry0, set->entry0.rip, currentStack, addr)) {
+			copy_rip_entry(&set->u.entry1, currentStack, addr);
 		} else {
 			return;
 		}
 	} else if (set->nr_entries == 2) {
-		t = set->u.entry1;
-		if (rips_eq(addr, set->entry0) ||
-		    rips_eq(addr, t))
+		if (rips_equal(&set->entry0, currentStack, addr) ||
+		    rips_equal(&set->u.entry1, currentStack, addr))
 			return;
 		set->nr_entries_allocated = 16;
-		set->u.entry1N = VG_(malloc)("address set OOL", sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1));
-		if (rip_less_than(addr, set->entry0)) {
-			set->u.entry1N[0] = set->entry0;
-			set->u.entry1N[1] = t;
-			set->entry0 = addr;
-		} else if (rip_less_than(addr, t)) {
-			set->u.entry1N[0] = addr;
-			set->u.entry1N[1] = t;
+		ool = VG_(malloc)("address set OOL", sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1));
+		VG_(memset)(ool, 0, sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1));
+		if (rip_less_than(currentStack, addr, &set->entry0, set->entry0.rip)) {
+			ool[0] = set->entry0;
+			ool[1] = set->u.entry1;
+			copy_rip_entry(&set->entry0, currentStack, addr);
+		} else if (rip_less_than(currentStack, addr, &set->u.entry1, set->u.entry1.rip)) {
+			copy_rip_entry(&ool[0], currentStack, addr);
+			ool[1] = set->u.entry1;
 		} else {
-			set->u.entry1N[0] = t;
-			set->u.entry1N[1] = addr;
+			ool[0] = set->u.entry1;
+			copy_rip_entry(&ool[1], currentStack, addr);
 		}
+		set->u.entry1N = ool;
 	} else {
-		if (rips_eq(addr, set->entry0))
+		if (rips_equal(&set->entry0, currentStack, addr))
 			return;
-		if (rip_less_than(addr, set->entry0)) {
+		if (rip_less_than(currentStack, addr, &set->entry0, set->entry0.rip)) {
 			if (set->nr_entries_allocated == set->nr_entries) {
 				set->nr_entries_allocated *= 4;
 				set->u.entry1N = VG_(realloc)("address set OOL",
@@ -158,7 +199,7 @@ add_address_to_set(struct address_set *set, unsigned long _addr,
 				     sizeof(set->u.entry1N[0]) *
 				     (set->nr_entries - 1));
 			set->u.entry1N[0] = set->entry0;
-			set->entry0 = addr;
+			copy_rip_entry(&set->entry0, currentStack, addr);
 		} else {
 			/* Binary chop to find the place to insert.
 			   The indexes point at places *between* the
@@ -220,10 +261,10 @@ add_address_to_set(struct address_set *set, unsigned long _addr,
 				    So this will terminate, and will
 				    terminate with the right answer.
 				*/
-				if (rip_less_than(addr, set->u.entry1N[probe])) {
+				if (rip_less_than(currentStack, addr, &set->u.entry1N[probe], set->u.entry1N[probe].rip)) {
 					tl_assert(high != probe);
 					high = probe;
-				} else if (rips_eq(addr, set->u.entry1N[probe])) {
+				} else if (rips_equal(&set->u.entry1N[probe], currentStack, addr)) {
 					return;
 				} else {
 					tl_assert(low != probe + 1);
@@ -242,18 +283,20 @@ add_address_to_set(struct address_set *set, unsigned long _addr,
 			VG_(memmove)(set->u.entry1N + low + 1,
 				     set->u.entry1N + low,
 				     sizeof(set->u.entry1N[0]) * (set->nr_entries - 1 - low));
-			set->u.entry1N[low] = addr;
+			copy_rip_entry(set->u.entry1N + low, currentStack, addr);
 		}
 	}
 	set->nr_entries++;
-	//sanity_check_set(set);
+	sanity_check_set(set);
 }
 
 static void
 log_store(unsigned long rip, unsigned long addr, unsigned size, int private)
 {
 	struct addr_hash_entry *ahe = find_addr_hash_entry(addr);
-	add_address_to_set(&ahe->content.stores, rip, "store", addr, private);
+	add_address_to_set(&ahe->content.stores, rip, private);
+
+	sanity_check_addr_hash();
 }
 
 struct stack_data {
@@ -306,7 +349,8 @@ do_log_load(unsigned long addr, unsigned long rip)
 	if (is_stack(addr))
 		return;
 	ahe = find_addr_hash_entry(addr);
-	add_address_to_set(&ahe->content.loads, rip, "load", addr, memory_location_is_private(addr));
+	add_address_to_set(&ahe->content.loads, rip, memory_location_is_private(addr));
+	sanity_check_addr_hash();
 }
 
 static void
@@ -474,6 +518,7 @@ ft2_instrument(VgCallbackClosure* closure,
 {
 	IRSB *b;
 	b = log_loads(log_stores(bb));
+	maintain_call_stack(b);
 	return b;
 }
 
@@ -497,13 +542,13 @@ hash_address_set(const struct address_set *s)
 	case 0:
 		return 0;
 	case 1:
-		return rip_hash(s->entry0);
+		return hash_rip(&s->entry0, s->entry0.rip);
 	case 2:
-		return rip_hash(s->entry0) * 4099 + rip_hash(s->u.entry1);
+		return hash_rip(&s->entry0, s->entry0.rip) * 4099 + hash_rip(&s->u.entry1, s->u.entry1.rip);
 	default:
-		hash = rip_hash(s->entry0);
+		hash = hash_rip(&s->entry0, s->entry0.rip);
 		for (x = 1; x < s->nr_entries; x++)
-			hash = hash * 8191 + rip_hash(s->u.entry1N[x-1]);
+			hash = hash * 8191 + hash_rip(&s->u.entry1N[x-1], s->u.entry1N[x-1].rip);
 		return hash;
 	}
 }
@@ -524,14 +569,14 @@ sets_equal(const struct address_set *s1, const struct address_set *s2)
 		return 0;
 	if (s1->nr_entries == 0)
 		return 1;
-	if (!rips_eq(s1->entry0, s2->entry0))
+	if (!rips_equal(&s1->entry0, &s2->entry0, s2->entry0.rip))
 		return 0;
 	if (s1->nr_entries == 1)
 		return 1;
 	if (s1->nr_entries == 2)
-		return rips_eq(s1->u.entry1, s2->u.entry1);
+		return rips_equal(&s1->u.entry1, &s2->u.entry1, s2->u.entry1.rip);
 	for (x = 0; x < s1->nr_entries - 1; x++)
-		if (!rips_eq(s1->u.entry1N[x], s2->u.entry1N[x]))
+		if (!rips_equal(&s1->u.entry1N[x], &s2->u.entry1N[x], s2->u.entry1N[x].rip))
 			return 0;
 	return 1;
 }
@@ -552,16 +597,22 @@ dump_set(const struct address_set *as)
 		VG_(printf)("\t\t<empty>\n");
 		break;
 	case 1:
-		VG_(printf)("\t\t0x%lx\n", as->entry0.addr);
+		VG_(printf)("\t\t");
+		print_rip_entry(&as->entry0);
 		break;
 	case 2:
-		VG_(printf)("\t\t0x%lx\n", as->entry0.addr);
-		VG_(printf)("\t\t0x%lx\n", as->u.entry1.addr);
+		VG_(printf)("\t\t");
+		print_rip_entry(&as->entry0);
+		VG_(printf)("\t\t");
+		print_rip_entry(&as->u.entry1);
 		break;
 	default:
-		VG_(printf)("\t\t0x%lx\n", as->entry0.addr);
-		for (i = 0; i < as->nr_entries - 1; i++)
-			VG_(printf)("\t\t0x%lx\n", as->u.entry1N[i].addr);
+		VG_(printf)("\t\t");
+		print_rip_entry(&as->entry0);
+		for (i = 0; i < as->nr_entries - 1; i++) {
+			VG_(printf)("\t\t");
+			print_rip_entry(&as->u.entry1N[i]);
+		}
 		break;
 	}
 }
@@ -575,6 +626,21 @@ dump_set_pair(const struct addr_set_pair *s)
 	dump_set(&s->loads);
 }
 
+static struct rip_entry *
+get_set_entry(struct address_set *se, int idx)
+{
+	if (idx == 0)
+		return &se->entry0;
+	if (idx == 1) {
+		if (se->nr_entries > 2)
+			return &se->u.entry1N[0];
+		else
+			return &se->u.entry1;
+	} else {
+		return &se->u.entry1N[idx - 1];
+	}
+}
+
 /* Add the set @s to the global set of sets.  Zap it to an empty set
    at the same time. */
 static void
@@ -583,15 +649,25 @@ fold_set_to_global_set(struct addr_set_pair *s)
 	unsigned long h = hash_addr_set_pair(s);
 	unsigned head = h % NR_SS_HEADS;
 	struct set_of_sets_entry *sse;
+	int i;
+
+	dump_set(&s->loads);
+
+	sanity_check_set(&s->stores);
+	sanity_check_set(&s->loads);
 
 	for (sse = ss_heads[head]; sse; sse = sse->next) {
 		if (sse->h == h &&
 		    set_pairs_equal(s, &sse->content)) {
+			for (i = 0; i < s->stores.nr_entries; i++)
+				free_rip_entry(get_set_entry(&s->stores, i));
 			if (s->stores.nr_entries > 2)
 				VG_(free)(s->stores.u.entry1N);
 			s->stores.nr_entries = 0;
 			s->stores.nr_entries_allocated = 0;
 
+			for (i = 0; i < s->loads.nr_entries; i++)
+				free_rip_entry(get_set_entry(&s->loads, i));
 			if (s->loads.nr_entries > 2)
 				VG_(free)(s->loads.u.entry1N);
 			s->loads.nr_entries = 0;
@@ -619,10 +695,13 @@ static void
 ft2_fini(Int exitcode)
 {
 	int x;
+	int i;
 	struct addr_hash_entry *ahe;
 	struct set_of_sets_entry *sse;
 	struct write_file output;
 	Char buf[128];
+
+	sanity_check_addr_hash();
 
 	for (x = 0; x < NR_ADDR_HASH_HEADS; x++)
 		for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next)
@@ -642,36 +721,16 @@ ft2_fini(Int exitcode)
 				hdr.nr_loads = sse->content.loads.nr_entries;
 				hdr.nr_stores = sse->content.stores.nr_entries;
 				write_file(&output, &hdr, sizeof(hdr));
-				if (sse->content.loads.nr_entries > 0) {
-					write_file(&output, &sse->content.loads.entry0,
-						   sizeof(sse->content.loads.entry0));
-					if (sse->content.loads.nr_entries == 2) {
-						write_file(&output, &sse->content.loads.u.entry1,
-							   sizeof(sse->content.loads.u.entry1));
-					} else {
-						write_file(&output, sse->content.loads.u.entry1N,
-							   sizeof(sse->content.loads.u.entry1N[0]) *
-							   (sse->content.loads.nr_entries-1));
-					}
-				}
-				if (sse->content.stores.nr_entries > 0) {
-					write_file(&output, &sse->content.stores.entry0,
-						   sizeof(sse->content.stores.entry0));
-					if (sse->content.stores.nr_entries == 2) {
-						write_file(&output, &sse->content.stores.u.entry1,
-							   sizeof(sse->content.stores.u.entry1));
-					} else {
-						write_file(&output, sse->content.stores.u.entry1N,
-							   sizeof(sse->content.stores.u.entry1N[0]) *
-							   (sse->content.stores.nr_entries-1));
-					}
-				}
+				for (i = 0; i < sse->content.loads.nr_entries; i++)
+					write_rip_entry(&output,
+							get_set_entry(&sse->content.loads, i));
+				for (i = 0; i < sse->content.stores.nr_entries; i++)
+					write_rip_entry(&output,
+							get_set_entry(&sse->content.stores, i));
 			}
 		}
 	}
-	VG_(printf)("Total file size %ld\n", output.offset);
 	close_write_file(&output);
-	VG_(printf)("Wrote %ld bytes to file\n", output.written);
 }
 
 static void

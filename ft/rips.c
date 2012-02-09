@@ -94,6 +94,9 @@ copy_rip_entry(struct rip_entry *dest, const struct rip_entry *src, unsigned lon
 		dest->out_of_line_content = VG_(malloc)("rip_entry_content", sizeof(dest->content[0]) * dest->nr_entries_allocated);
 		VG_(memcpy)(dest->out_of_line_content, src->out_of_line_content,
 			    sizeof(dest->out_of_line_content[0]) * dest->nr_entries_allocated);
+	} else {
+		/* For sanity */
+		dest->out_of_line_content = NULL;
 	}
 	dest->rip = rip;
 }
@@ -102,10 +105,13 @@ static void
 print_rip_entry(const struct rip_entry *re)
 {
 	int i;
-	for (i = 0; i < re->nr_entries && i < NR_INLINE_RIPS; i++)
-		VG_(printf)("%lx\n", re->content[i]);
-	for ( ; i < re->nr_entries; i++)
-		VG_(printf)("%lx\n", re->out_of_line_content[i]);
+	VG_(printf)("%lx: ", re->rip);
+	for (i = 0; i < re->nr_entries; i++) {
+		if (i != 0)
+			VG_(printf)(", ");
+		VG_(printf)("%lx", get_re_entry(re, i));
+	}
+	VG_(printf)("\n");
 }
 
 static void
@@ -208,3 +214,22 @@ maintain_call_stack(IRSB *bb)
 	}
 }
 
+static void
+free_rip_entry(struct rip_entry *re)
+{
+	if (re->nr_entries_allocated > 0)
+		VG_(free)(re->out_of_line_content);
+}
+
+static void
+sanity_check_rip(const struct rip_entry *re)
+{
+	int x;
+
+	tl_assert(re->nr_entries < 10000000);
+	tl_assert(re->rip != 0);
+	if (re->nr_entries > NR_INLINE_RIPS)
+		tl_assert(re->nr_entries_allocated >= re->nr_entries - NR_INLINE_RIPS);
+	for (x = 0; x < re->nr_entries; x++)
+		tl_assert(get_re_entry(re, x) != 0);
+}
