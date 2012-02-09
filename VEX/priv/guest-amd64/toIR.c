@@ -13572,7 +13572,7 @@ DisResult disInstr_AMD64_WRK (
       t2 = newTemp(Ity_I64);
       assign(t2, mkU64((Addr64)d64));
       make_redzone_AbiHint(vbi, t1, t2/*nia*/, "call-d32");
-      if (resteerOkFn( callback_opaque, (Addr64)d64) ) {
+      if (0 && resteerOkFn( callback_opaque, (Addr64)d64) ) {
          /* follow into the call target. */
          dres.whatNext   = Dis_Resteer;
          dres.continueAt = d64;
