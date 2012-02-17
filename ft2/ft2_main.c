@@ -15,7 +15,6 @@
 
 #define CHECK_SANITY 0
 
-static unsigned long total_malloced;
 enum mallocers_t {
 	mallocer_addr_hash_entry = 0,
 	mallocer_set_of_sets_entry = 1,
@@ -24,6 +23,8 @@ enum mallocers_t {
 	mallocer_addr_set_ool = 4,
 	mallocer_last
 };
+#if 0
+static unsigned long total_malloced;
 static unsigned long mallocer_mallocs[mallocer_last];
 
 static void
@@ -49,6 +50,14 @@ log_free(unsigned long amt, enum mallocers_t mallocer)
 	mallocer_mallocs[mallocer] -= amt;
 	total_malloced -= amt;
 }
+#else
+static void
+log_malloc(unsigned long ign1, enum mallocers_t ign2)
+{}
+static void
+log_free(unsigned long ign1, enum mallocers_t ign2)
+{}
+#endif
 
 static void *
 logged_malloc(HChar *name, unsigned long amt, enum mallocers_t mallocer)
@@ -202,7 +211,7 @@ add_address_to_set(struct address_set *set, unsigned long _addr, int private)
 {
 	struct rip_entry *currentStack = &thread_callstacks[VG_(get_running_tid)()];
 	int low, high;
-	unsigned long addr = private ? _addr : _addr | (1ul << 63);
+	unsigned long addr = !private ? _addr : _addr | (1ul << 63);
 	struct rip_entry *ool;
 
 	sanity_check_set(set);
@@ -745,6 +754,8 @@ ft2_fini(Int exitcode)
 		VG_(sprintf)(buf, "types%d.dat", x);
 	} while (open_write_file(&output, buf) != 0);
 
+	VG_(printf)("Dumping results to %s\n", buf);
+
 	for (x = 0; x < NR_SS_HEADS; x++) {
 		for (sse = ss_heads[x]; sse; sse = sse->next) {
 			if (sse->content.stores.nr_entries > 0 ||
@@ -763,6 +774,9 @@ ft2_fini(Int exitcode)
 		}
 	}
 	close_write_file(&output);
+
+	VG_(printf)("Finished writing results\n");
+
 }
 
 static void
