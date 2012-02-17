@@ -75,13 +75,9 @@ typedef struct rip_entry rip_t;
 
 struct address_set {
 	int nr_entries;
-	int nr_entries_allocated; /* including entry0.  Only valid if nr_entries >= 3 */
-	/* Common case is for there to be <=2 entries in the set, so optimise for that. */
+	int nr_entries_allocated; /* including entry0. */
 	rip_t entry0;
-	union {
-		rip_t entry1;
-		rip_t *entry1N;
-	} u;
+	rip_t *entry1N;
 };
 
 struct addr_set_pair {
@@ -214,51 +210,36 @@ add_address_to_set(struct address_set *set, unsigned long _addr, int private)
 	if (set->nr_entries == 0) {
 		copy_rip_entry(&set->entry0, currentStack, addr);
 	} else if (set->nr_entries == 1) {
-		if (rip_less_than(currentStack, addr, &set->entry0, set->entry0.rip)) {
-			set->u.entry1 = set->entry0;
-			copy_rip_entry(&set->entry0, currentStack, addr);
-		} else if (rip_less_than(&set->entry0, set->entry0.rip, currentStack, addr)) {
-			copy_rip_entry(&set->u.entry1, currentStack, addr);
-		} else {
+		if (rips_equal(&set->entry0, currentStack, addr))
 			return;
-		}
-	} else if (set->nr_entries == 2) {
-		if (rips_equal(&set->entry0, currentStack, addr) ||
-		    rips_equal(&set->u.entry1, currentStack, addr))
-			return;
-		set->nr_entries_allocated = 16;
-		ool = logged_malloc("address set OOL", sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1),
+		set->nr_entries_allocated = 2;
+		ool = logged_malloc("address set OOL", sizeof(set->entry1N[0]) * (set->nr_entries_allocated-1),
 				    mallocer_addr_set_ool);
-		VG_(memset)(ool, 0, sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1));
+		VG_(memset)(ool, 0, sizeof(set->entry1N[0]) * (set->nr_entries_allocated-1));
 		if (rip_less_than(currentStack, addr, &set->entry0, set->entry0.rip)) {
 			ool[0] = set->entry0;
-			ool[1] = set->u.entry1;
 			copy_rip_entry(&set->entry0, currentStack, addr);
-		} else if (rip_less_than(currentStack, addr, &set->u.entry1, set->u.entry1.rip)) {
-			copy_rip_entry(&ool[0], currentStack, addr);
-			ool[1] = set->u.entry1;
 		} else {
-			ool[0] = set->u.entry1;
-			copy_rip_entry(&ool[1], currentStack, addr);
+			copy_rip_entry(&ool[0], currentStack, addr);
 		}
-		set->u.entry1N = ool;
+		set->entry1N = ool;
 	} else {
 		if (rips_equal(&set->entry0, currentStack, addr))
 			return;
 		if (rip_less_than(currentStack, addr, &set->entry0, set->entry0.rip)) {
 			if (set->nr_entries_allocated == set->nr_entries) {
 				set->nr_entries_allocated *= 4;
-				set->u.entry1N = logged_realloc("address set OOL",
-								set->u.entry1N,
-								sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated/4-1),
-								sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1),
-								mallocer_addr_set_ool);
+				set->entry1N = logged_realloc("address set OOL",
+							      set->entry1N,
+							      sizeof(set->entry1N[0]) * (set->nr_entries_allocated/4-1),
+							      sizeof(set->entry1N[0]) * (set->nr_entries_allocated-1),
+							      mallocer_addr_set_ool);
 			}
-			VG_(memmove)(set->u.entry1N + 1,
-				     set->u.entry1N,
-				     sizeof(set->u.entry1N[0]) *
+			VG_(memmove)(set->entry1N + 1,
+				     set->entry1N,
+				     sizeof(set->entry1N[0]) *
 				     (set->nr_entries - 1));
-			set->u.entry1N[0] = set->entry0;
+			set->entry1N[0] = set->entry0;
 			copy_rip_entry(&set->entry0, currentStack, addr);
 		} else {
 			/* Binary chop to find the place to insert.
@@ -321,10 +302,10 @@ add_address_to_set(struct address_set *set, unsigned long _addr, int private)
 				    So this will terminate, and will
 				    terminate with the right answer.
 				*/
-				if (rip_less_than(currentStack, addr, &set->u.entry1N[probe], set->u.entry1N[probe].rip)) {
+				if (rip_less_than(currentStack, addr, &set->entry1N[probe], set->entry1N[probe].rip)) {
 					tl_assert(high != probe);
 					high = probe;
-				} else if (rips_equal(&set->u.entry1N[probe], currentStack, addr)) {
+				} else if (rips_equal(&set->entry1N[probe], currentStack, addr)) {
 					return;
 				} else {
 					tl_assert(low != probe + 1);
@@ -336,16 +317,16 @@ add_address_to_set(struct address_set *set, unsigned long _addr, int private)
 			tl_assert(low == high);
 			if (set->nr_entries_allocated == set->nr_entries) {
 				set->nr_entries_allocated *= 4;
-				set->u.entry1N = logged_realloc("address set OOL",
-								set->u.entry1N,
-								sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated/4-1),
-								sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1),
+				set->entry1N = logged_realloc("address set OOL",
+								set->entry1N,
+								sizeof(set->entry1N[0]) * (set->nr_entries_allocated/4-1),
+								sizeof(set->entry1N[0]) * (set->nr_entries_allocated-1),
 								mallocer_addr_set_ool);
 			}
-			VG_(memmove)(set->u.entry1N + low + 1,
-				     set->u.entry1N + low,
-				     sizeof(set->u.entry1N[0]) * (set->nr_entries - 1 - low));
-			copy_rip_entry(set->u.entry1N + low, currentStack, addr);
+			VG_(memmove)(set->entry1N + low + 1,
+				     set->entry1N + low,
+				     sizeof(set->entry1N[0]) * (set->nr_entries - 1 - low));
+			copy_rip_entry(set->entry1N + low, currentStack, addr);
 		}
 	}
 	set->nr_entries++;
@@ -605,12 +586,10 @@ hash_address_set(const struct address_set *s)
 		return 0;
 	case 1:
 		return hash_rip(&s->entry0, s->entry0.rip);
-	case 2:
-		return hash_rip(&s->entry0, s->entry0.rip) * 4099 + hash_rip(&s->u.entry1, s->u.entry1.rip);
 	default:
 		hash = hash_rip(&s->entry0, s->entry0.rip);
 		for (x = 1; x < s->nr_entries; x++)
-			hash = hash * 8191 + hash_rip(&s->u.entry1N[x-1], s->u.entry1N[x-1].rip);
+			hash = hash * 8191 + hash_rip(&s->entry1N[x-1], s->entry1N[x-1].rip);
 		return hash;
 	}
 }
@@ -635,10 +614,8 @@ sets_equal(const struct address_set *s1, const struct address_set *s2)
 		return 0;
 	if (s1->nr_entries == 1)
 		return 1;
-	if (s1->nr_entries == 2)
-		return rips_equal(&s1->u.entry1, &s2->u.entry1, s2->u.entry1.rip);
 	for (x = 0; x < s1->nr_entries - 1; x++)
-		if (!rips_equal(&s1->u.entry1N[x], &s2->u.entry1N[x], s2->u.entry1N[x].rip))
+		if (!rips_equal(&s1->entry1N[x], &s2->entry1N[x], s2->entry1N[x].rip))
 			return 0;
 	return 1;
 }
@@ -662,18 +639,12 @@ dump_set(const struct address_set *as)
 		VG_(printf)("\t\t");
 		print_rip_entry(&as->entry0);
 		break;
-	case 2:
-		VG_(printf)("\t\t");
-		print_rip_entry(&as->entry0);
-		VG_(printf)("\t\t");
-		print_rip_entry(&as->u.entry1);
-		break;
 	default:
 		VG_(printf)("\t\t");
 		print_rip_entry(&as->entry0);
 		for (i = 0; i < as->nr_entries - 1; i++) {
 			VG_(printf)("\t\t");
-			print_rip_entry(&as->u.entry1N[i]);
+			print_rip_entry(&as->entry1N[i]);
 		}
 		break;
 	}
@@ -693,14 +664,8 @@ get_set_entry(struct address_set *se, int idx)
 {
 	if (idx == 0)
 		return &se->entry0;
-	if (idx == 1) {
-		if (se->nr_entries > 2)
-			return &se->u.entry1N[0];
-		else
-			return &se->u.entry1;
-	} else {
-		return &se->u.entry1N[idx - 1];
-	}
+	else
+		return &se->entry1N[idx - 1];
 }
 
 /* Add the set @s to the global set of sets.  Zap it to an empty set
@@ -722,8 +687,8 @@ fold_set_to_global_set(struct addr_set_pair *s)
 			for (i = 0; i < s->stores.nr_entries; i++)
 				free_rip_entry(get_set_entry(&s->stores, i));
 			if (s->stores.nr_entries > 2) {
-				VG_(free)(s->stores.u.entry1N);
-				log_free(sizeof(s->stores.u.entry1N[0]) * (s->stores.nr_entries_allocated-1),
+				VG_(free)(s->stores.entry1N);
+				log_free(sizeof(s->stores.entry1N[0]) * (s->stores.nr_entries_allocated-1),
 					 mallocer_addr_set_ool);
 			}
 
@@ -733,8 +698,8 @@ fold_set_to_global_set(struct addr_set_pair *s)
 			for (i = 0; i < s->loads.nr_entries; i++)
 				free_rip_entry(get_set_entry(&s->loads, i));
 			if (s->loads.nr_entries > 2) {
-				VG_(free)(s->loads.u.entry1N);
-				log_free(sizeof(s->loads.u.entry1N[0]) * (s->loads.nr_entries_allocated-1),
+				VG_(free)(s->loads.entry1N);
+				log_free(sizeof(s->loads.entry1N[0]) * (s->loads.nr_entries_allocated-1),
 					 mallocer_addr_set_ool);
 			}
 			s->loads.nr_entries = 0;
