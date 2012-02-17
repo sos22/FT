@@ -91,7 +91,9 @@ copy_rip_entry(struct rip_entry *dest, const struct rip_entry *src, unsigned lon
 	}
 	VG_(memcpy)(dest->content, src->content, sizeof(dest->content[0]) * nr_inline);
 	if (dest->nr_entries_allocated != 0) {
-		dest->out_of_line_content = VG_(malloc)("rip_entry_content", sizeof(dest->content[0]) * dest->nr_entries_allocated);
+		dest->out_of_line_content = logged_malloc("rip_entry_content",
+							  sizeof(dest->content[0]) * dest->nr_entries_allocated,
+							  mallocer_rip_entry_content);
 		VG_(memcpy)(dest->out_of_line_content, src->out_of_line_content,
 			    sizeof(dest->out_of_line_content[0]) * dest->nr_entries_allocated);
 	} else {
@@ -123,10 +125,14 @@ push_call_stack(unsigned long rip)
 	} else {
 		if (caller->nr_entries >= NR_INLINE_RIPS + caller->nr_entries_allocated) {
 			caller->nr_entries_allocated += 32;
-			caller->out_of_line_content = VG_(realloc)("rip_entry_out_of_line",
-								   caller->out_of_line_content,
-								   (caller->nr_entries_allocated - NR_INLINE_RIPS) * sizeof(caller->out_of_line_content[0]));
+			caller->out_of_line_content =
+				logged_realloc("rip_entry_out_of_line",
+					       caller->out_of_line_content,
+					       (caller->nr_entries_allocated - 32) * sizeof(caller->out_of_line_content[0]),
+					       caller->nr_entries_allocated * sizeof(caller->out_of_line_content[0]),
+					       mallocer_rip_entry_content);
 		}
+		tl_assert(caller->nr_entries - NR_INLINE_RIPS < caller->nr_entries_allocated);
 		caller->out_of_line_content[caller->nr_entries - NR_INLINE_RIPS] = rip;
 	}
 	caller->nr_entries++;
@@ -217,8 +223,11 @@ maintain_call_stack(IRSB *bb)
 static void
 free_rip_entry(struct rip_entry *re)
 {
-	if (re->nr_entries_allocated > 0)
+	if (re->nr_entries_allocated > 0) {
+		log_free(sizeof(re->out_of_line_content[0]) * re->nr_entries_allocated,
+			 mallocer_rip_entry_content);
 		VG_(free)(re->out_of_line_content);
+	}
 }
 
 static void

@@ -13,6 +13,58 @@
 
 #define PAGE_SIZE (4096ul)
 
+#define CHECK_SANITY 0
+
+static unsigned long total_malloced;
+enum mallocers_t {
+	mallocer_addr_hash_entry = 0,
+	mallocer_set_of_sets_entry = 1,
+	mallocer_mte_entry = 2,
+	mallocer_rip_entry_content = 3,
+	mallocer_addr_set_ool = 4,
+	mallocer_last
+};
+static unsigned long mallocer_mallocs[mallocer_last];
+
+static void
+log_malloc(unsigned long amt, enum mallocers_t mallocer)
+{
+	mallocer_mallocs[mallocer] += amt;
+	total_malloced += amt;
+	if ((total_malloced - amt) >> 20 != total_malloced >> 20) {
+		int i;
+		VG_(printf)("%ld bytes allocated total, breakdown:\n", total_malloced);
+		for (i = 0; i < mallocer_last; i++)
+			VG_(printf)("Alloc %d -> %ld\n", i, mallocer_mallocs[i]);
+	}
+}
+
+static void
+log_free(unsigned long amt, enum mallocers_t mallocer)
+{
+	if (mallocer_mallocs[mallocer] < amt)
+		VG_(printf)("%d: release %ld, but only allocted %ld\n", mallocer,
+			    amt, mallocer_mallocs[mallocer]);
+	tl_assert(mallocer_mallocs[mallocer] >= amt);
+	mallocer_mallocs[mallocer] -= amt;
+	total_malloced -= amt;
+}
+
+static void *
+logged_malloc(HChar *name, unsigned long amt, enum mallocers_t mallocer)
+{
+	log_malloc(amt, mallocer);
+	return VG_(malloc)(name, amt);
+}
+
+static void *
+logged_realloc(HChar *name, void *old_ptr, unsigned long old_size, unsigned long new_size, enum mallocers_t mallocer)
+{
+	log_free(old_size, mallocer);
+	log_malloc(new_size, mallocer);
+	return VG_(realloc)(name, old_ptr, new_size);
+}
+
 #include "../ft/shared.c"
 #include "../ft/io.c"
 #include "../ft/rips.c"
@@ -81,6 +133,7 @@ rip_less_than(const struct rip_entry *re1, unsigned long rip1,
 static void
 sanity_check_set(const struct address_set *as)
 {
+#if CHECK_SANITY
        int x;
 
        tl_assert(as->nr_entries >= 0);
@@ -103,6 +156,7 @@ sanity_check_set(const struct address_set *as)
                tl_assert(rip_less_than(&as->u.entry1N[x], as->u.entry1N[x].rip,
 				       &as->u.entry1N[x+1], as->u.entry1N[x+1].rip));
        }
+#endif
 }
 
 static unsigned
@@ -123,18 +177,20 @@ find_addr_hash_entry(unsigned long addr)
 	if (cursor) {
 		return cursor;
 	}
-	cursor = VG_(malloc)("addr_hash_entry", sizeof(*cursor));
+	cursor = logged_malloc("addr_hash_entry", sizeof(*cursor), mallocer_addr_hash_entry);
 	cursor->next = addr_hash_heads[hash];
 	cursor->addr = addr;
 	cursor->content.stores.nr_entries = 0;
 	cursor->content.loads.nr_entries = 0;
 	addr_hash_heads[hash] = cursor;
+
 	return cursor;
 }
 
 static void
 sanity_check_addr_hash(void)
 {
+#if CHECK_SANITY
 	unsigned x;
 	struct addr_hash_entry *cursor;
 	for (x = 0; x < NR_ADDR_HASH_HEADS; x++)
@@ -142,6 +198,7 @@ sanity_check_addr_hash(void)
 			sanity_check_set(&cursor->content.stores);
 			sanity_check_set(&cursor->content.loads);
 		}
+#endif
 }
 
 static void
@@ -170,7 +227,8 @@ add_address_to_set(struct address_set *set, unsigned long _addr, int private)
 		    rips_equal(&set->u.entry1, currentStack, addr))
 			return;
 		set->nr_entries_allocated = 16;
-		ool = VG_(malloc)("address set OOL", sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1));
+		ool = logged_malloc("address set OOL", sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1),
+				    mallocer_addr_set_ool);
 		VG_(memset)(ool, 0, sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1));
 		if (rip_less_than(currentStack, addr, &set->entry0, set->entry0.rip)) {
 			ool[0] = set->entry0;
@@ -190,9 +248,11 @@ add_address_to_set(struct address_set *set, unsigned long _addr, int private)
 		if (rip_less_than(currentStack, addr, &set->entry0, set->entry0.rip)) {
 			if (set->nr_entries_allocated == set->nr_entries) {
 				set->nr_entries_allocated *= 4;
-				set->u.entry1N = VG_(realloc)("address set OOL",
-							      set->u.entry1N,
-							      sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1));
+				set->u.entry1N = logged_realloc("address set OOL",
+								set->u.entry1N,
+								sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated/4-1),
+								sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1),
+								mallocer_addr_set_ool);
 			}
 			VG_(memmove)(set->u.entry1N + 1,
 				     set->u.entry1N,
@@ -276,9 +336,11 @@ add_address_to_set(struct address_set *set, unsigned long _addr, int private)
 			tl_assert(low == high);
 			if (set->nr_entries_allocated == set->nr_entries) {
 				set->nr_entries_allocated *= 4;
-				set->u.entry1N = VG_(realloc)("address set OOL",
-							      set->u.entry1N,
-							      sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1));
+				set->u.entry1N = logged_realloc("address set OOL",
+								set->u.entry1N,
+								sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated/4-1),
+								sizeof(set->u.entry1N[0]) * (set->nr_entries_allocated-1),
+								mallocer_addr_set_ool);
 			}
 			VG_(memmove)(set->u.entry1N + low + 1,
 				     set->u.entry1N + low,
@@ -651,8 +713,6 @@ fold_set_to_global_set(struct addr_set_pair *s)
 	struct set_of_sets_entry *sse;
 	int i;
 
-	dump_set(&s->loads);
-
 	sanity_check_set(&s->stores);
 	sanity_check_set(&s->loads);
 
@@ -661,22 +721,29 @@ fold_set_to_global_set(struct addr_set_pair *s)
 		    set_pairs_equal(s, &sse->content)) {
 			for (i = 0; i < s->stores.nr_entries; i++)
 				free_rip_entry(get_set_entry(&s->stores, i));
-			if (s->stores.nr_entries > 2)
+			if (s->stores.nr_entries > 2) {
 				VG_(free)(s->stores.u.entry1N);
+				log_free(sizeof(s->stores.u.entry1N[0]) * (s->stores.nr_entries_allocated-1),
+					 mallocer_addr_set_ool);
+			}
+
 			s->stores.nr_entries = 0;
 			s->stores.nr_entries_allocated = 0;
 
 			for (i = 0; i < s->loads.nr_entries; i++)
 				free_rip_entry(get_set_entry(&s->loads, i));
-			if (s->loads.nr_entries > 2)
+			if (s->loads.nr_entries > 2) {
 				VG_(free)(s->loads.u.entry1N);
+				log_free(sizeof(s->loads.u.entry1N[0]) * (s->loads.nr_entries_allocated-1),
+					 mallocer_addr_set_ool);
+			}
 			s->loads.nr_entries = 0;
 			s->loads.nr_entries_allocated = 0;
 			return;
 		}
 	}
 
-	sse = VG_(malloc)("set_of_sets_entry", sizeof(*sse));
+	sse = logged_malloc("set_of_sets_entry", sizeof(*sse), mallocer_set_of_sets_entry);
 	sse->h = h;
 	sse->content = *s;
 	s->stores.nr_entries = 0;
@@ -785,13 +852,15 @@ _sanity_check_memory_tree(unsigned long start, unsigned long end, const struct m
 static void
 sanity_check_memory_tree(void)
 {
-	//_sanity_check_memory_tree(0, ~0ul, memory_root);
+#if CHECK_SANITY
+	_sanity_check_memory_tree(0, ~0ul, memory_root);
+#endif
 }
 
 static struct memory_tree_entry *
 new_memory_tree_entry(unsigned long start, unsigned long end)
 {
-	struct memory_tree_entry *mte = VG_(malloc)("mte_entry", sizeof(*mte));
+	struct memory_tree_entry *mte = logged_malloc("mte_entry", sizeof(*mte), mallocer_mte_entry);
 	mte->private = 1;
 	mte->start = start;
 	mte->end = end;
