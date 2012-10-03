@@ -1,7 +1,11 @@
+#include <sys/types.h>
+
 #include "pub_tool_basics.h"
+#include "pub_tool_vki.h"
 #include "pub_tool_tooliface.h"
 #include "pub_tool_libcbase.h"
 #include "pub_tool_libcassert.h"
+#include "pub_tool_libcfile.h"
 #include "pub_tool_libcprint.h"
 #include "pub_tool_replacemalloc.h"
 #include "pub_tool_mallocfree.h"
@@ -17,68 +21,457 @@
 
 #define CHECK_SANITY 0
 
-enum mallocers_t {
-	mallocer_addr_hash_entry = 0,
-	mallocer_set_of_sets_entry = 1,
-	mallocer_mte_entry = 2,
-	mallocer_rip_entry_content = 3,
-	mallocer_addr_set_ool = 4,
-	mallocer_last
+struct write_file {
+	int fd;
+	unsigned long offset;
+	unsigned long written;
+	unsigned buf_prod;
+	unsigned char buf[1024];
 };
-#if 0
-static unsigned long total_malloced;
-static unsigned long mallocer_mallocs[mallocer_last];
+
+static void do_store(unsigned long addr, unsigned long data, unsigned long size,
+		     unsigned long rip);
+static void do_store2(unsigned long addr, unsigned long x1, unsigned long x2,
+		      unsigned long rip);
+
+static IRTemp
+cast_to_U64(IRSB *irsb, IRExpr *expr)
+{
+	IROp op;
+	IRTemp tmp;
+
+	switch (typeOfIRExpr(irsb->tyenv, expr)) {
+	case Ity_I8:
+		op = Iop_8Uto64;
+		break;
+	case Ity_I16:
+		op = Iop_16Uto64;
+		break;
+	case Ity_I32:
+		op = Iop_32Uto64;
+		break;
+	case Ity_F64:
+		op = Iop_ReinterpF64asI64;
+		break;
+	case Ity_F32:
+		tmp = newIRTemp(irsb->tyenv, Ity_I32);
+		addStmtToIRSB(irsb,
+			      IRStmt_WrTmp(tmp,
+					   IRExpr_Unop(Iop_ReinterpF32asI32,
+						       expr)));
+		return cast_to_U64(irsb,
+				   IRExpr_RdTmp(tmp));
+	default:
+		VG_(tool_panic)((Char *)"Weird-arse type problem.\n");
+	}
+	tmp = newIRTemp(irsb->tyenv, Ity_I64);
+	addStmtToIRSB(irsb,
+		      IRStmt_WrTmp(tmp,
+				   IRExpr_Unop(op, expr)));
+	return tmp;
+}
 
 static void
-log_malloc(unsigned long amt, enum mallocers_t mallocer)
+add_dirty_call(IRSB *irsb,
+	       char *name,
+	       void *ptr,
+	       ...)
 {
-	mallocer_mallocs[mallocer] += amt;
-	total_malloced += amt;
-	if ((total_malloced - amt) >> 20 != total_malloced >> 20) {
-		int i;
-		VG_(printf)("%ld bytes allocated total, breakdown:\n", total_malloced);
-		for (i = 0; i < mallocer_last; i++)
-			VG_(printf)("Alloc %d -> %ld\n", i, mallocer_mallocs[i]);
+	va_list args;
+	int nr_args;
+	IRExpr *e;
+	IRExpr **arg_v;
+	IRDirty *dirty;
+
+	va_start(args, ptr);
+	nr_args = 0;
+	while (1) {
+		e = va_arg(args, IRExpr *);
+		if (!e)
+			break;
+		nr_args++;
+	}
+	va_end(args);
+
+	arg_v = LibVEX_Alloc( (nr_args + 1) * sizeof(arg_v[0]) );
+	va_start(args, ptr);
+	nr_args = 0;
+	while (1) {
+		e = va_arg(args, IRExpr *);
+		if (!e)
+			break;
+		arg_v[nr_args] = e;
+		nr_args++;
+	}
+	arg_v[nr_args] = NULL;
+	va_end(args);
+
+	dirty = unsafeIRDirty_0_N(0, name, ptr, arg_v);
+	addStmtToIRSB(irsb, IRStmt_Dirty(dirty) );
+}
+
+
+static void
+constructLoggingStore(IRSB *irsb,
+		      IRExpr *addr,
+		      IRExpr *data,
+		      unsigned long rip)
+{
+	IRType t = typeOfIRExpr(irsb->tyenv, data);
+	IRTemp tmp1, tmp2;
+	int is_vector = 0;
+
+	switch (t) {
+	case Ity_I8:
+	case Ity_I16:
+	case Ity_I32:
+	case Ity_F32:
+	case Ity_F64:
+		tmp1 = cast_to_U64(irsb, data);
+		add_dirty_call(irsb,
+			       "do_store",
+			       do_store,
+			       addr,
+			       IRExpr_RdTmp(tmp1),
+			       IRExpr_Const(IRConst_U64(sizeofIRType(t))),
+			       IRExpr_Const(IRConst_U64(rip)),
+			       NULL);
+		break;
+	case Ity_I64:
+		add_dirty_call(irsb,
+			       "do_store",
+			       do_store,
+			       addr,
+			       data,
+			       IRExpr_Const(IRConst_U64(8)),
+			       IRExpr_Const(IRConst_U64(rip)),
+			       NULL);
+		break;
+	case Ity_V128:
+		is_vector = 1;
+	case Ity_I128:
+		tmp1 = newIRTemp(irsb->tyenv, Ity_I64);
+		tmp2 = newIRTemp(irsb->tyenv, Ity_I64);
+		addStmtToIRSB(
+			irsb,
+			IRStmt_WrTmp(
+				tmp1,
+				IRExpr_Unop(
+					is_vector ? Iop_V128to64 : Iop_128to64,
+					data)));
+		addStmtToIRSB(
+			irsb,
+			IRStmt_WrTmp(
+				tmp2,
+				IRExpr_Unop(
+					is_vector ? Iop_V128HIto64 : Iop_128HIto64,
+					data)));
+		add_dirty_call(irsb,
+			       "do_store2",
+			       do_store2,
+			       addr,
+			       IRExpr_RdTmp(tmp1),
+			       IRExpr_RdTmp(tmp2),
+			       IRExpr_Const(IRConst_U64(rip)),
+			       NULL);
+		break;
+	default:
+		VG_(tool_panic)("Store of unexpected type\n");
+	}
+}
+
+static IRSB *
+log_stores(IRSB *bb)
+{
+	IRSB *out = deepCopyIRSBExceptStmts(bb);
+	int x;
+	IRStmt *stmt;
+	unsigned long instr_start;
+
+	instr_start = 0xcafebabedeadbeef;
+	for (x = 0; x < bb->stmts_used; x++) {
+		stmt = bb->stmts[x];
+		if (stmt->tag != Ist_Store) {
+			addStmtToIRSB(out, stmt);
+		} else {
+			constructLoggingStore(out,
+					      stmt->Ist.Store.addr,
+					      stmt->Ist.Store.data,
+					      instr_start);
+		}
+		if (stmt->tag == Ist_IMark)
+			instr_start = stmt->Ist.IMark.addr;
+	}
+	return out;
+}
+
+static int
+open_write_file(struct write_file *out, const Char *fname)
+{
+	SysRes sr;
+
+	sr = VG_(open)(fname, VKI_O_WRONLY|VKI_O_CREAT|VKI_O_EXCL, 0600);
+	if (sr.isError)
+		return sr.err;
+	out->fd = sr.res;
+	out->buf_prod = 0;
+	out->offset = 0;
+	out->written = 0;
+	return 0;
+}
+
+static void
+write_file(struct write_file *wf, const void *buf, size_t sz)
+{
+	unsigned to_copy;
+	unsigned x;
+	int y;
+
+	wf->offset += sz;
+	while (sz != 0) {
+		if (wf->buf_prod == sizeof(wf->buf)) {
+			for (x = 0; x < wf->buf_prod; x += y) {
+				y = VG_(write)(wf->fd, wf->buf + x, wf->buf_prod - x);
+				tl_assert(y > 0);
+				wf->written += y;
+			}
+			wf->buf_prod = 0;
+		}
+
+		to_copy = sz;
+		if (wf->buf_prod + to_copy >= sizeof(wf->buf))
+			to_copy = sizeof(wf->buf) - wf->buf_prod;
+		VG_(memcpy)(wf->buf + wf->buf_prod, buf, to_copy);
+		wf->buf_prod += to_copy;
+		buf = (void *)((unsigned long)buf + to_copy);
+		sz -= to_copy;
 	}
 }
 
 static void
-log_free(unsigned long amt, enum mallocers_t mallocer)
+close_write_file(struct write_file *wf)
 {
-	if (mallocer_mallocs[mallocer] < amt)
-		VG_(printf)("%d: release %ld, but only allocted %ld\n", mallocer,
-			    amt, mallocer_mallocs[mallocer]);
-	tl_assert(mallocer_mallocs[mallocer] >= amt);
-	mallocer_mallocs[mallocer] -= amt;
-	total_malloced -= amt;
+	int x, y;
+	for (x = 0; x < wf->buf_prod; x+= y) {
+		y = VG_(write)(wf->fd, wf->buf + x, wf->buf_prod - x);
+		tl_assert(y > 0);
+		wf->written += y;
+	}
+	VG_(close)(wf->fd);
 }
-#else
+
+#define NR_INLINE_RIPS 8
+
+struct rip_entry {
+	unsigned long rip;
+	unsigned nr_entries;
+	unsigned nr_entries_allocated;
+	unsigned long content[NR_INLINE_RIPS];
+	unsigned long *out_of_line_content;
+};
+
+static struct rip_entry thread_callstacks[VG_N_THREADS];
+
+static unsigned long
+get_re_entry(const struct rip_entry *re, unsigned idx)
+{
+	if (idx >= NR_INLINE_RIPS)
+		return re->out_of_line_content[idx-NR_INLINE_RIPS];
+	else
+		return re->content[idx];
+}
+
+/* advance to the next one in a way which avoids considering any
+   cycles in the stack (e.g. recursive functions). */
+static int
+next_re_idx(const struct rip_entry *re, unsigned long entry)
+{
+	unsigned long entry2;
+	int y;
+
+	for (y = 0; y < re->nr_entries; y++) {
+		entry2 = get_re_entry(re, y);
+		if (entry2 == entry)
+			return y - 1;
+	}
+	tl_assert(0);
+	return -1;
+}
+
+static unsigned
+hash_rip(const struct rip_entry *re, unsigned long rip)
+{
+	unsigned long addr = rip;
+	unsigned long entry;
+	int x;
+	int nr_inline = re->nr_entries;
+	if (nr_inline > NR_INLINE_RIPS)
+		nr_inline = NR_INLINE_RIPS;
+	for (x = re->nr_entries - 1; x >= 0; ) {
+		entry = get_re_entry(re, x);
+		addr = ((addr << 31) | (addr >> 33)) ^ entry;
+		x = next_re_idx(re, entry);
+	}
+	return addr;
+}
+
+static int
+rips_equal(const struct rip_entry *re1, const struct rip_entry *re2, unsigned long rip)
+{
+	int idx1, idx2;
+	unsigned long entry1, entry2;
+
+	if (re1->rip != rip)
+		return 0;
+	idx1 = re1->nr_entries - 1;
+	idx2 = re2->nr_entries - 1;
+	while (idx1 >= 0 && idx2 >= 0) {
+		entry1 = get_re_entry(re1, idx1);
+		entry2 = get_re_entry(re2, idx2);
+		if (entry1 != entry2)
+			return 0;
+		idx1 = next_re_idx(re1, entry1);
+		idx2 = next_re_idx(re2, entry2);
+	}
+	if (idx1 >= 0 || idx2 >= 0)
+		return 0;
+	return 1;
+}
+
 static void
-log_malloc(unsigned long ign1, enum mallocers_t ign2)
-{}
+copy_rip_entry(struct rip_entry *dest, const struct rip_entry *src, unsigned long rip)
+{
+	int nr_inline;
+
+	dest->nr_entries = src->nr_entries;
+	if (dest->nr_entries < NR_INLINE_RIPS) {
+		dest->nr_entries_allocated = 0;
+		nr_inline = dest->nr_entries;
+	} else {
+		dest->nr_entries_allocated = dest->nr_entries - NR_INLINE_RIPS;
+		nr_inline = NR_INLINE_RIPS;
+	}
+	VG_(memcpy)(dest->content, src->content, sizeof(dest->content[0]) * nr_inline);
+	if (dest->nr_entries_allocated != 0) {
+		dest->out_of_line_content = VG_(malloc)("rip_entry_content",
+							sizeof(dest->content[0]) * dest->nr_entries_allocated);
+		VG_(memcpy)(dest->out_of_line_content, src->out_of_line_content,
+			    sizeof(dest->out_of_line_content[0]) * dest->nr_entries_allocated);
+	} else {
+		/* For sanity */
+		dest->out_of_line_content = NULL;
+	}
+	dest->rip = rip;
+}
+
 static void
-log_free(unsigned long ign1, enum mallocers_t ign2)
-{}
-#endif
-
-static void *
-logged_malloc(HChar *name, unsigned long amt, enum mallocers_t mallocer)
+push_call_stack(unsigned long rip)
 {
-	log_malloc(amt, mallocer);
-	return VG_(malloc)(name, amt);
+	struct rip_entry *caller = &thread_callstacks[VG_(get_running_tid)()];
+	if (caller->nr_entries < NR_INLINE_RIPS) {
+		caller->content[caller->nr_entries] = rip;
+	} else {
+		if (caller->nr_entries >= NR_INLINE_RIPS + caller->nr_entries_allocated) {
+			caller->nr_entries_allocated += 32;
+			caller->out_of_line_content =
+				VG_(realloc)("rip_entry_out_of_line",
+					     caller->out_of_line_content,
+					     caller->nr_entries_allocated * sizeof(caller->out_of_line_content[0]));
+		}
+		tl_assert(caller->nr_entries - NR_INLINE_RIPS < caller->nr_entries_allocated);
+		caller->out_of_line_content[caller->nr_entries - NR_INLINE_RIPS] = rip;
+	}
+	caller->nr_entries++;
+	return;
 }
 
-static void *
-logged_realloc(HChar *name, void *old_ptr, unsigned long old_size, unsigned long new_size, enum mallocers_t mallocer)
+static void
+pop_call_stack(unsigned long to)
 {
-	log_free(old_size, mallocer);
-	log_malloc(new_size, mallocer);
-	return VG_(realloc)(name, old_ptr, new_size);
+	struct rip_entry *caller = &thread_callstacks[VG_(get_running_tid)()];
+	if (caller->nr_entries > 0) {
+		unsigned long retaddr;
+		if (caller->nr_entries - 1 >= NR_INLINE_RIPS)
+			retaddr = caller->out_of_line_content[caller->nr_entries - NR_INLINE_RIPS - 1];
+		else
+			retaddr = caller->content[caller->nr_entries - 1];
+		if (retaddr != to)
+			VG_(printf)("Wanted to return to %lx!\n", retaddr);
+		caller->nr_entries--;
+	}
 }
 
-#include "../ft/shared.c"
-#include "../ft/io.c"
-#include "../ft/rips.c"
+static void
+write_rip_entry(struct write_file *output, const struct rip_entry *re)
+{
+	int x;
+
+	write_file(output, &re->rip, sizeof(re->rip));
+	write_file(output, &re->nr_entries, sizeof(re->nr_entries));
+	for (x = 0; x < re->nr_entries && x < NR_INLINE_RIPS; x++)
+		write_file(output, &re->content[x], sizeof(re->content[x]));
+	for ( ; x < re->nr_entries; x++)
+		write_file(output, &re->out_of_line_content[x-NR_INLINE_RIPS], sizeof(re->out_of_line_content[0]));
+}
+
+static void
+maintain_call_stack(IRSB *bb)
+{
+	unsigned long rip = 0;
+	unsigned long endRip;
+	int i;
+	IRTemp tmp;
+
+	if (bb->jumpkind == Ijk_Call) {
+		for (i = bb->stmts_used - 1; !rip && i >= 0; i--)
+			if (bb->stmts[i]->tag == Ist_IMark) {
+				rip = bb->stmts[i]->Ist.IMark.addr;
+				endRip = rip + bb->stmts[i]->Ist.IMark.len;
+			}
+		if (bb->next->tag == Iex_RdTmp) {
+			tmp = bb->next->Iex.RdTmp.tmp;
+		} else {
+			tmp = newIRTemp(bb->tyenv, Ity_I64);
+			addStmtToIRSB(bb,
+				      IRStmt_WrTmp(tmp, bb->next));
+			bb->next = IRExpr_RdTmp(tmp);
+		}
+		addStmtToIRSB(bb,
+			      IRStmt_Dirty(
+				      unsafeIRDirty_0_N(
+					      0,
+					      "push_call_stack",
+					      push_call_stack,
+					      mkIRExprVec_1(
+						      IRExpr_Const(IRConst_U64(endRip))))));
+	}
+	if (bb->jumpkind == Ijk_Ret) {
+		if (bb->next->tag == Iex_RdTmp) {
+			tmp = bb->next->Iex.RdTmp.tmp;
+		} else {
+			tmp = newIRTemp(bb->tyenv, Ity_I64);
+			addStmtToIRSB(bb,
+				      IRStmt_WrTmp(tmp, bb->next));
+			bb->next = IRExpr_RdTmp(tmp);
+		}
+		addStmtToIRSB(bb,
+			      IRStmt_Dirty(
+				      unsafeIRDirty_0_N(
+					      0,
+					      "pop_call_stack",
+					      pop_call_stack,
+					      mkIRExprVec_1(
+						      IRExpr_RdTmp(tmp)
+						      ))));
+	}
+}
+
+static void
+free_rip_entry(struct rip_entry *re)
+{
+	if (re->nr_entries_allocated > 0)
+		VG_(free)(re->out_of_line_content);
+}
 
 static int i_am_multithreaded;
 
@@ -186,7 +579,7 @@ find_addr_hash_entry(unsigned long addr)
 	if (cursor) {
 		return cursor;
 	}
-	cursor = logged_malloc("addr_hash_entry", sizeof(*cursor), mallocer_addr_hash_entry);
+	cursor = VG_(malloc)("addr_hash_entry", sizeof(*cursor));
 	cursor->next = addr_hash_heads[hash];
 	cursor->addr = addr;
 	cursor->content.stores.nr_entries = 0;
@@ -226,8 +619,7 @@ add_address_to_set(struct address_set *set, unsigned long _addr, int private)
 		if (rips_equal(&set->entry0, currentStack, addr))
 			return;
 		set->nr_entries_allocated = 2;
-		ool = logged_malloc("address set OOL", sizeof(set->entry1N[0]) * (set->nr_entries_allocated-1),
-				    mallocer_addr_set_ool);
+		ool = VG_(malloc)("address set OOL", sizeof(set->entry1N[0]) * (set->nr_entries_allocated-1));
 		VG_(memset)(ool, 0, sizeof(set->entry1N[0]) * (set->nr_entries_allocated-1));
 		if (rip_less_than(currentStack, addr, &set->entry0, set->entry0.rip)) {
 			ool[0] = set->entry0;
@@ -242,11 +634,9 @@ add_address_to_set(struct address_set *set, unsigned long _addr, int private)
 		if (rip_less_than(currentStack, addr, &set->entry0, set->entry0.rip)) {
 			if (set->nr_entries_allocated == set->nr_entries) {
 				set->nr_entries_allocated *= 4;
-				set->entry1N = logged_realloc("address set OOL",
-							      set->entry1N,
-							      sizeof(set->entry1N[0]) * (set->nr_entries_allocated/4-1),
-							      sizeof(set->entry1N[0]) * (set->nr_entries_allocated-1),
-							      mallocer_addr_set_ool);
+				set->entry1N = VG_(realloc)("address set OOL",
+							    set->entry1N,
+							    sizeof(set->entry1N[0]) * (set->nr_entries_allocated-1));
 			}
 			VG_(memmove)(set->entry1N + 1,
 				     set->entry1N,
@@ -330,11 +720,9 @@ add_address_to_set(struct address_set *set, unsigned long _addr, int private)
 			tl_assert(low == high);
 			if (set->nr_entries_allocated == set->nr_entries) {
 				set->nr_entries_allocated *= 4;
-				set->entry1N = logged_realloc("address set OOL",
-								set->entry1N,
-								sizeof(set->entry1N[0]) * (set->nr_entries_allocated/4-1),
-								sizeof(set->entry1N[0]) * (set->nr_entries_allocated-1),
-								mallocer_addr_set_ool);
+				set->entry1N = VG_(realloc)("address set OOL",
+							    set->entry1N,
+							    sizeof(set->entry1N[0]) * (set->nr_entries_allocated-1));
 			}
 			VG_(memmove)(set->entry1N + low + 1,
 				     set->entry1N + low,
@@ -640,38 +1028,6 @@ set_pairs_equal(const struct addr_set_pair *a, const struct addr_set_pair *b)
 		sets_equal(&a->loads, &b->loads);
 }
 
-static void
-dump_set(const struct address_set *as)
-{
-	int i;
-	switch (as->nr_entries) {
-	case 0:
-		VG_(printf)("\t\t<empty>\n");
-		break;
-	case 1:
-		VG_(printf)("\t\t");
-		print_rip_entry(&as->entry0);
-		break;
-	default:
-		VG_(printf)("\t\t");
-		print_rip_entry(&as->entry0);
-		for (i = 0; i < as->nr_entries - 1; i++) {
-			VG_(printf)("\t\t");
-			print_rip_entry(&as->entry1N[i]);
-		}
-		break;
-	}
-}
-
-static void
-dump_set_pair(const struct addr_set_pair *s)
-{
-	VG_(printf)("\tStores:\n");
-	dump_set(&s->stores);
-	VG_(printf)("\tLoads:\n");
-	dump_set(&s->loads);
-}
-
 static struct rip_entry *
 get_set_entry(struct address_set *se, int idx)
 {
@@ -699,29 +1055,23 @@ fold_set_to_global_set(struct addr_set_pair *s)
 		    set_pairs_equal(s, &sse->content)) {
 			for (i = 0; i < s->stores.nr_entries; i++)
 				free_rip_entry(get_set_entry(&s->stores, i));
-			if (s->stores.nr_entries > 2) {
+			if (s->stores.nr_entries > 2)
 				VG_(free)(s->stores.entry1N);
-				log_free(sizeof(s->stores.entry1N[0]) * (s->stores.nr_entries_allocated-1),
-					 mallocer_addr_set_ool);
-			}
 
 			s->stores.nr_entries = 0;
 			s->stores.nr_entries_allocated = 0;
 
 			for (i = 0; i < s->loads.nr_entries; i++)
 				free_rip_entry(get_set_entry(&s->loads, i));
-			if (s->loads.nr_entries > 2) {
+			if (s->loads.nr_entries > 2)
 				VG_(free)(s->loads.entry1N);
-				log_free(sizeof(s->loads.entry1N[0]) * (s->loads.nr_entries_allocated-1),
-					 mallocer_addr_set_ool);
-			}
 			s->loads.nr_entries = 0;
 			s->loads.nr_entries_allocated = 0;
 			return;
 		}
 	}
 
-	sse = logged_malloc("set_of_sets_entry", sizeof(*sse), mallocer_set_of_sets_entry);
+	sse = VG_(malloc)("set_of_sets_entry", sizeof(*sse));
 	sse->h = h;
 	sse->content = *s;
 	s->stores.nr_entries = 0;
@@ -822,6 +1172,7 @@ struct memory_tree_entry {
 
 static struct memory_tree_entry *memory_root;
 
+#if CHECK_SANITY
 static void
 _sanity_check_memory_tree(unsigned long start, unsigned long end, const struct memory_tree_entry *mte)
 {
@@ -836,6 +1187,7 @@ _sanity_check_memory_tree(unsigned long start, unsigned long end, const struct m
 	if (mte->next)
 		_sanity_check_memory_tree(mte->end, end, mte->next);
 }
+#endif
 static void
 sanity_check_memory_tree(void)
 {
@@ -847,7 +1199,7 @@ sanity_check_memory_tree(void)
 static struct memory_tree_entry *
 new_memory_tree_entry(unsigned long start, unsigned long end)
 {
-	struct memory_tree_entry *mte = logged_malloc("mte_entry", sizeof(*mte), mallocer_mte_entry);
+	struct memory_tree_entry *mte = VG_(malloc)("mte_entry", sizeof(*mte));
 	mte->private = 1;
 	mte->start = start;
 	mte->end = end;
