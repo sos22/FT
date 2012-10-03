@@ -263,7 +263,6 @@ close_write_file(struct write_file *wf)
 #define NR_INLINE_RIPS 8
 
 struct rip_entry {
-	unsigned long rip;
 	unsigned nr_entries;
 	unsigned nr_entries_allocated;
 	unsigned long content[NR_INLINE_RIPS];
@@ -299,9 +298,9 @@ next_re_idx(const struct rip_entry *re, unsigned long entry)
 }
 
 static unsigned
-hash_rip(const struct rip_entry *re, unsigned long rip)
+hash_rip(const struct rip_entry *re)
 {
-	unsigned long addr = rip;
+	unsigned long addr = 0;
 	unsigned long entry;
 	int x;
 	int nr_inline = re->nr_entries;
@@ -316,13 +315,11 @@ hash_rip(const struct rip_entry *re, unsigned long rip)
 }
 
 static int
-rips_equal(const struct rip_entry *re1, const struct rip_entry *re2, unsigned long rip)
+rips_equal(const struct rip_entry *re1, const struct rip_entry *re2)
 {
 	int idx1, idx2;
 	unsigned long entry1, entry2;
 
-	if (re1->rip != rip)
-		return 0;
 	idx1 = re1->nr_entries - 1;
 	idx2 = re2->nr_entries - 1;
 	while (idx1 >= 0 && idx2 >= 0) {
@@ -339,7 +336,7 @@ rips_equal(const struct rip_entry *re1, const struct rip_entry *re2, unsigned lo
 }
 
 static void
-copy_rip_entry(struct rip_entry *dest, const struct rip_entry *src, unsigned long rip)
+copy_rip_entry(struct rip_entry *dest, const struct rip_entry *src)
 {
 	int nr_inline;
 
@@ -361,13 +358,11 @@ copy_rip_entry(struct rip_entry *dest, const struct rip_entry *src, unsigned lon
 		/* For sanity */
 		dest->out_of_line_content = NULL;
 	}
-	dest->rip = rip;
 }
 
 static void
-push_call_stack(unsigned long rip)
+push_call_stack(struct rip_entry *caller, unsigned long rip)
 {
-	struct rip_entry *caller = &thread_callstacks[VG_(get_running_tid)()];
 	if (caller->nr_entries < NR_INLINE_RIPS) {
 		caller->content[caller->nr_entries] = rip;
 	} else {
@@ -384,11 +379,15 @@ push_call_stack(unsigned long rip)
 	caller->nr_entries++;
 	return;
 }
+static void
+_push_call_stack(unsigned long rip)
+{
+	push_call_stack(&thread_callstacks[VG_(get_running_tid)()], rip);
+}
 
 static void
-pop_call_stack(unsigned long to)
+pop_call_stack(struct rip_entry *caller, unsigned long to)
 {
-	struct rip_entry *caller = &thread_callstacks[VG_(get_running_tid)()];
 	if (caller->nr_entries > 0) {
 		unsigned long retaddr;
 		if (caller->nr_entries - 1 >= NR_INLINE_RIPS)
@@ -400,13 +399,17 @@ pop_call_stack(unsigned long to)
 		caller->nr_entries--;
 	}
 }
+static void
+_pop_call_stack(unsigned long rip)
+{
+	pop_call_stack(&thread_callstacks[VG_(get_running_tid)()], rip);
+}
 
 static void
 write_rip_entry(struct write_file *output, const struct rip_entry *re)
 {
 	int x;
 
-	write_file(output, &re->rip, sizeof(re->rip));
 	write_file(output, &re->nr_entries, sizeof(re->nr_entries));
 	for (x = 0; x < re->nr_entries && x < NR_INLINE_RIPS; x++)
 		write_file(output, &re->content[x], sizeof(re->content[x]));
@@ -441,7 +444,7 @@ maintain_call_stack(IRSB *bb)
 				      unsafeIRDirty_0_N(
 					      0,
 					      "push_call_stack",
-					      push_call_stack,
+					      _push_call_stack,
 					      mkIRExprVec_1(
 						      IRExpr_Const(IRConst_U64(endRip))))));
 	}
@@ -459,7 +462,7 @@ maintain_call_stack(IRSB *bb)
 				      unsafeIRDirty_0_N(
 					      0,
 					      "pop_call_stack",
-					      pop_call_stack,
+					      _pop_call_stack,
 					      mkIRExprVec_1(
 						      IRExpr_RdTmp(tmp)
 						      ))));
@@ -503,15 +506,10 @@ static int memory_location_is_private(unsigned long addr);
 static void make_memory_location_public(unsigned long addr);
 
 static int
-rip_less_than(const struct rip_entry *re1, unsigned long rip1,
-	      const struct rip_entry *re2, unsigned long rip2)
+rip_less_than(const struct rip_entry *re1, const struct rip_entry *re2)
 {
 	int idx1, idx2;
 	unsigned long entry1, entry2;
-	if (rip1 < rip2)
-		return 1;
-	if (rip1 > rip2)
-		return 0;
 
 	idx1 = re1->nr_entries - 1;
 	idx2 = re2->nr_entries - 1;
@@ -604,34 +602,32 @@ sanity_check_addr_hash(void)
 }
 
 static void
-add_address_to_set(struct address_set *set, unsigned long _addr, int private)
+add_address_to_set(struct address_set *set, const struct rip_entry *entry)
 {
-	struct rip_entry *currentStack = &thread_callstacks[VG_(get_running_tid)()];
 	int low, high;
-	unsigned long addr = !private ? _addr : _addr | (1ul << 63);
 	struct rip_entry *ool;
 
 	sanity_check_set(set);
-	tl_assert(_addr != 0);
+
 	if (set->nr_entries == 0) {
-		copy_rip_entry(&set->entry0, currentStack, addr);
+		copy_rip_entry(&set->entry0, entry);
 	} else if (set->nr_entries == 1) {
-		if (rips_equal(&set->entry0, currentStack, addr))
+		if (rips_equal(&set->entry0, entry))
 			return;
 		set->nr_entries_allocated = 2;
 		ool = VG_(malloc)("address set OOL", sizeof(set->entry1N[0]) * (set->nr_entries_allocated-1));
 		VG_(memset)(ool, 0, sizeof(set->entry1N[0]) * (set->nr_entries_allocated-1));
-		if (rip_less_than(currentStack, addr, &set->entry0, set->entry0.rip)) {
+		if (rip_less_than(entry, &set->entry0)) {
 			ool[0] = set->entry0;
-			copy_rip_entry(&set->entry0, currentStack, addr);
+			copy_rip_entry(&set->entry0, entry);
 		} else {
-			copy_rip_entry(&ool[0], currentStack, addr);
+			copy_rip_entry(&ool[0], entry);
 		}
 		set->entry1N = ool;
 	} else {
-		if (rips_equal(&set->entry0, currentStack, addr))
+		if (rips_equal(&set->entry0, entry))
 			return;
-		if (rip_less_than(currentStack, addr, &set->entry0, set->entry0.rip)) {
+		if (rip_less_than(entry, &set->entry0)) {
 			if (set->nr_entries_allocated == set->nr_entries) {
 				set->nr_entries_allocated *= 4;
 				set->entry1N = VG_(realloc)("address set OOL",
@@ -643,7 +639,7 @@ add_address_to_set(struct address_set *set, unsigned long _addr, int private)
 				     sizeof(set->entry1N[0]) *
 				     (set->nr_entries - 1));
 			set->entry1N[0] = set->entry0;
-			copy_rip_entry(&set->entry0, currentStack, addr);
+			copy_rip_entry(&set->entry0, entry);
 		} else {
 			/* Binary chop to find the place to insert.
 			   The indexes point at places *between* the
@@ -705,10 +701,10 @@ add_address_to_set(struct address_set *set, unsigned long _addr, int private)
 				    So this will terminate, and will
 				    terminate with the right answer.
 				*/
-				if (rip_less_than(currentStack, addr, &set->entry1N[probe], set->entry1N[probe].rip)) {
+				if (rip_less_than(entry, &set->entry1N[probe])) {
 					tl_assert(high != probe);
 					high = probe;
-				} else if (rips_equal(&set->entry1N[probe], currentStack, addr)) {
+				} else if (rips_equal(&set->entry1N[probe], entry)) {
 					return;
 				} else {
 					tl_assert(low != probe + 1);
@@ -727,7 +723,7 @@ add_address_to_set(struct address_set *set, unsigned long _addr, int private)
 			VG_(memmove)(set->entry1N + low + 1,
 				     set->entry1N + low,
 				     sizeof(set->entry1N[0]) * (set->nr_entries - 1 - low));
-			copy_rip_entry(set->entry1N + low, currentStack, addr);
+			copy_rip_entry(set->entry1N + low, entry);
 		}
 	}
 	set->nr_entries++;
@@ -735,10 +731,21 @@ add_address_to_set(struct address_set *set, unsigned long _addr, int private)
 }
 
 static void
+add_current_address_to_set(struct address_set *set, unsigned long _addr, int private)
+{
+	struct rip_entry *currentStack = &thread_callstacks[VG_(get_running_tid)()];
+	unsigned long addr = !private ? _addr : _addr | (1ul << 63);
+	tl_assert(_addr != 0);
+	push_call_stack(currentStack, addr);
+	add_address_to_set(set, currentStack);
+	pop_call_stack(currentStack, addr);
+}
+
+static void
 log_store(unsigned long rip, unsigned long addr, unsigned size, int private)
 {
 	struct addr_hash_entry *ahe = find_addr_hash_entry(addr);
-	add_address_to_set(&ahe->content.stores, rip, private);
+	add_current_address_to_set(&ahe->content.stores, rip, private);
 
 	sanity_check_addr_hash();
 }
@@ -793,7 +800,7 @@ do_log_load(unsigned long addr, unsigned long rip)
 	if (is_stack(addr))
 		return;
 	ahe = find_addr_hash_entry(addr);
-	add_address_to_set(&ahe->content.loads, rip, memory_location_is_private(addr));
+	add_current_address_to_set(&ahe->content.loads, rip, memory_location_is_private(addr));
 	sanity_check_addr_hash();
 }
 
@@ -986,11 +993,11 @@ hash_address_set(const struct address_set *s)
 	case 0:
 		return 0;
 	case 1:
-		return hash_rip(&s->entry0, s->entry0.rip);
+		return hash_rip(&s->entry0);
 	default:
-		hash = hash_rip(&s->entry0, s->entry0.rip);
+		hash = hash_rip(&s->entry0);
 		for (x = 1; x < s->nr_entries; x++)
-			hash = hash * 8191 + hash_rip(&s->entry1N[x-1], s->entry1N[x-1].rip);
+			hash = hash * 8191 + hash_rip(&s->entry1N[x-1]);
 		return hash;
 	}
 }
@@ -1011,12 +1018,12 @@ sets_equal(const struct address_set *s1, const struct address_set *s2)
 		return 0;
 	if (s1->nr_entries == 0)
 		return 1;
-	if (!rips_equal(&s1->entry0, &s2->entry0, s2->entry0.rip))
+	if (!rips_equal(&s1->entry0, &s2->entry0))
 		return 0;
 	if (s1->nr_entries == 1)
 		return 1;
 	for (x = 0; x < s1->nr_entries - 1; x++)
-		if (!rips_equal(&s1->entry1N[x], &s2->entry1N[x], s2->entry1N[x].rip))
+		if (!rips_equal(&s1->entry1N[x], &s2->entry1N[x]))
 			return 0;
 	return 1;
 }
