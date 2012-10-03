@@ -33,6 +33,8 @@ static void do_store(unsigned long addr, unsigned long data, unsigned long size,
 		     unsigned long rip);
 static void do_store2(unsigned long addr, unsigned long x1, unsigned long x2,
 		      unsigned long rip);
+static int memory_location_is_private(unsigned long addr);
+static void make_memory_location_public(unsigned long addr);
 
 static IRTemp
 cast_to_U64(IRSB *irsb, IRExpr *expr)
@@ -335,6 +337,29 @@ rips_equal(const struct rip_entry *re1, const struct rip_entry *re2)
 	return 1;
 }
 
+static int
+rip_less_than(const struct rip_entry *re1, const struct rip_entry *re2)
+{
+	int idx1, idx2;
+	unsigned long entry1, entry2;
+
+	idx1 = re1->nr_entries - 1;
+	idx2 = re2->nr_entries - 1;
+	while (idx1 >= 0 && idx2 >= 0) {
+		entry1 = get_re_entry(re1, idx1);
+		entry2 = get_re_entry(re2, idx2);
+		if (entry1 < entry2)
+			return 1;
+		if (entry1 > entry2)
+			return 0;
+		idx1 = next_re_idx(re1, entry1);
+		idx2 = next_re_idx(re2, entry2);
+	}
+	if (idx2 >= 0)
+		return 1;
+	return 0;
+}
+
 static void
 copy_rip_entry(struct rip_entry *dest, const struct rip_entry *src)
 {
@@ -478,58 +503,30 @@ free_rip_entry(struct rip_entry *re)
 
 static int i_am_multithreaded;
 
-typedef struct rip_entry rip_t;
-
-struct address_set {
+struct rip_set {
 	int nr_entries;
 	int nr_entries_allocated; /* including entry0. */
-	rip_t entry0;
-	rip_t *entry1N;
+	struct rip_entry entry0;
+	struct rip_entry *entry1N;
 };
 
-struct addr_set_pair {
-	struct address_set stores;
-	struct address_set loads;
+struct rip_set_pair {
+	struct rip_set stores;
+	struct rip_set loads;
 };
 
 struct addr_hash_entry {
 	struct addr_hash_entry *next;
 	unsigned long addr;
-	struct addr_set_pair content;
+	struct rip_set_pair content;
 };
 
 #define NR_ADDR_HASH_HEADS 100271
 static struct addr_hash_entry *
 addr_hash_heads[NR_ADDR_HASH_HEADS];
 
-static int memory_location_is_private(unsigned long addr);
-static void make_memory_location_public(unsigned long addr);
-
-static int
-rip_less_than(const struct rip_entry *re1, const struct rip_entry *re2)
-{
-	int idx1, idx2;
-	unsigned long entry1, entry2;
-
-	idx1 = re1->nr_entries - 1;
-	idx2 = re2->nr_entries - 1;
-	while (idx1 >= 0 && idx2 >= 0) {
-		entry1 = get_re_entry(re1, idx1);
-		entry2 = get_re_entry(re2, idx2);
-		if (entry1 < entry2)
-			return 1;
-		if (entry1 > entry2)
-			return 0;
-		idx1 = next_re_idx(re1, entry1);
-		idx2 = next_re_idx(re2, entry2);
-	}
-	if (idx2 >= 0)
-		return 1;
-	return 0;
-}
-
 static void
-sanity_check_set(const struct address_set *as)
+sanity_check_set(const struct rip_set *as)
 {
 #if CHECK_SANITY
        int x;
@@ -557,52 +554,8 @@ sanity_check_set(const struct address_set *as)
 #endif
 }
 
-static unsigned
-hash_address(unsigned long addr)
-{
-	while (addr > NR_ADDR_HASH_HEADS)
-		addr = (addr % NR_ADDR_HASH_HEADS) ^ (addr / NR_ADDR_HASH_HEADS);
-	return addr;
-}
-
-static struct addr_hash_entry *
-find_addr_hash_entry(unsigned long addr)
-{
-	unsigned hash;
-	struct addr_hash_entry *cursor;
-	addr -= addr % 8;
-	hash = hash_address(addr);
-	for (cursor = addr_hash_heads[hash]; cursor && cursor->addr != addr; cursor = cursor->next)
-		;
-	if (cursor) {
-		return cursor;
-	}
-	cursor = VG_(malloc)("addr_hash_entry", sizeof(*cursor));
-	cursor->next = addr_hash_heads[hash];
-	cursor->addr = addr;
-	cursor->content.stores.nr_entries = 0;
-	cursor->content.loads.nr_entries = 0;
-	addr_hash_heads[hash] = cursor;
-
-	return cursor;
-}
-
 static void
-sanity_check_addr_hash(void)
-{
-#if CHECK_SANITY
-	unsigned x;
-	struct addr_hash_entry *cursor;
-	for (x = 0; x < NR_ADDR_HASH_HEADS; x++)
-		for (cursor = addr_hash_heads[x]; cursor; cursor = cursor->next) {
-			sanity_check_set(&cursor->content.stores);
-			sanity_check_set(&cursor->content.loads);
-		}
-#endif
-}
-
-static void
-add_address_to_set(struct address_set *set, const struct rip_entry *entry)
+add_address_to_set(struct rip_set *set, const struct rip_entry *entry)
 {
 	int low, high;
 	struct rip_entry *ool;
@@ -731,7 +684,7 @@ add_address_to_set(struct address_set *set, const struct rip_entry *entry)
 }
 
 static void
-add_current_address_to_set(struct address_set *set, unsigned long _addr, int private)
+add_current_address_to_set(struct rip_set *set, unsigned long _addr, int private)
 {
 	struct rip_entry *currentStack = &thread_callstacks[VG_(get_running_tid)()];
 	unsigned long addr = !private ? _addr : _addr | (1ul << 63);
@@ -739,6 +692,50 @@ add_current_address_to_set(struct address_set *set, unsigned long _addr, int pri
 	push_call_stack(currentStack, addr);
 	add_address_to_set(set, currentStack);
 	pop_call_stack(currentStack, addr);
+}
+
+static unsigned
+hash_address(unsigned long addr)
+{
+	while (addr > NR_ADDR_HASH_HEADS)
+		addr = (addr % NR_ADDR_HASH_HEADS) ^ (addr / NR_ADDR_HASH_HEADS);
+	return addr;
+}
+
+static struct addr_hash_entry *
+find_addr_hash_entry(unsigned long addr)
+{
+	unsigned hash;
+	struct addr_hash_entry *cursor;
+	addr -= addr % 8;
+	hash = hash_address(addr);
+	for (cursor = addr_hash_heads[hash]; cursor && cursor->addr != addr; cursor = cursor->next)
+		;
+	if (cursor) {
+		return cursor;
+	}
+	cursor = VG_(malloc)("addr_hash_entry", sizeof(*cursor));
+	cursor->next = addr_hash_heads[hash];
+	cursor->addr = addr;
+	cursor->content.stores.nr_entries = 0;
+	cursor->content.loads.nr_entries = 0;
+	addr_hash_heads[hash] = cursor;
+
+	return cursor;
+}
+
+static void
+sanity_check_addr_hash(void)
+{
+#if CHECK_SANITY
+	unsigned x;
+	struct addr_hash_entry *cursor;
+	for (x = 0; x < NR_ADDR_HASH_HEADS; x++)
+		for (cursor = addr_hash_heads[x]; cursor; cursor = cursor->next) {
+			sanity_check_set(&cursor->content.stores);
+			sanity_check_set(&cursor->content.loads);
+		}
+#endif
 }
 
 static void
@@ -976,7 +973,7 @@ ft2_instrument(VgCallbackClosure* closure,
 struct set_of_sets_entry {
 	struct set_of_sets_entry *next;
 	unsigned long h;
-	struct addr_set_pair content;
+	struct rip_set_pair content;
 };
 
 #define NR_SS_HEADS 32768
@@ -984,7 +981,7 @@ static struct set_of_sets_entry *
 ss_heads[NR_SS_HEADS];
 
 static unsigned long
-hash_address_set(const struct address_set *s)
+hash_rip_set(const struct rip_set *s)
 {
 	unsigned long hash;
 	int x;
@@ -1003,14 +1000,14 @@ hash_address_set(const struct address_set *s)
 }
 
 static unsigned long
-hash_addr_set_pair(const struct addr_set_pair *s)
+hash_addr_set_pair(const struct rip_set_pair *s)
 {
-	return hash_address_set(&s->loads) * 17 +
-		hash_address_set(&s->stores);
+	return hash_rip_set(&s->loads) * 17 +
+		hash_rip_set(&s->stores);
 }
 
 static int
-sets_equal(const struct address_set *s1, const struct address_set *s2)
+sets_equal(const struct rip_set *s1, const struct rip_set *s2)
 {
 	int x;
 
@@ -1029,14 +1026,14 @@ sets_equal(const struct address_set *s1, const struct address_set *s2)
 }
 
 static int
-set_pairs_equal(const struct addr_set_pair *a, const struct addr_set_pair *b)
+set_pairs_equal(const struct rip_set_pair *a, const struct rip_set_pair *b)
 {
 	return sets_equal(&a->stores, &b->stores) &&
 		sets_equal(&a->loads, &b->loads);
 }
 
 static struct rip_entry *
-get_set_entry(struct address_set *se, int idx)
+get_set_entry(struct rip_set *se, int idx)
 {
 	if (idx == 0)
 		return &se->entry0;
@@ -1047,7 +1044,7 @@ get_set_entry(struct address_set *se, int idx)
 /* Add the set @s to the global set of sets.  Zap it to an empty set
    at the same time. */
 static void
-fold_set_to_global_set(struct addr_set_pair *s)
+fold_set_to_global_set(struct rip_set_pair *s)
 {
 	unsigned long h = hash_addr_set_pair(s);
 	unsigned head = h % NR_SS_HEADS;
