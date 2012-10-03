@@ -51,22 +51,26 @@ main()
 		if (fread(&hdr, sizeof(hdr), 1, stdin) != 1)
 			err(1, "reading header");
 
-		printf("%lx Loads: ", ftell(stdin));
+		re = read_rip_entry(stdin);
+		print_rip_entry(re);
+		free(re);
+		printf(": Loads = {");
 		for (i = 0; i < hdr.nr_loads; i++) {
+			if (i != 0)
+				printf("; ");
 			re = read_rip_entry(stdin);
 			print_rip_entry(re);
-			printf("; ");
 			free(re);
 		}
 
-		printf("\nStores: ");
+		printf("}, Stores = {");
 		for (i = 0; i < hdr.nr_stores; i++) {
+			if (i != 0)
+				printf("; ");
 			re = read_rip_entry(stdin);
 			print_rip_entry(re);
-			printf("; ");
 			free(re);
 		}
-
-		printf("\n");
+		printf("}\n");
 	}
 }
