@@ -6,6 +6,8 @@
 #include "pub_tool_replacemalloc.h"
 #include "pub_tool_mallocfree.h"
 #include "pub_tool_threadstate.h"
+#include "pub_tool_xarray.h"
+#include "pub_tool_clientstate.h"
 
 #include "libvex_guest_offsets.h"
 
@@ -175,8 +177,10 @@ hash_address(unsigned long addr)
 static struct addr_hash_entry *
 find_addr_hash_entry(unsigned long addr)
 {
-	unsigned hash = hash_address(addr / 8);
+	unsigned hash;
 	struct addr_hash_entry *cursor;
+	addr -= addr % 8;
+	hash = hash_address(addr);
 	for (cursor = addr_hash_heads[hash]; cursor && cursor->addr != addr; cursor = cursor->next)
 		;
 	if (cursor) {
@@ -742,16 +746,20 @@ ft2_fini(Int exitcode)
 	struct write_file output;
 	Char buf[128];
 
+	VG_(printf)("ft2_fini() starts\n");
+	VG_(printf)("I am %s\n", VG_(args_the_exename));
 	sanity_check_addr_hash();
 
 	for (x = 0; x < NR_ADDR_HASH_HEADS; x++)
 		for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next)
 			fold_set_to_global_set(&ahe->content);
 
+	VG_(printf)("Done folding\n");
+
 	x = 0;
 	do {
 		x++;
-		VG_(sprintf)(buf, "types%d.dat", x);
+		VG_(sprintf)(buf, "/tmp/types%d.dat", x);
 	} while (open_write_file(&output, buf) != 0);
 
 	VG_(printf)("Dumping results to %s\n", buf);

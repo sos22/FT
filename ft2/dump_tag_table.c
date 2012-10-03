@@ -55,7 +55,7 @@ main()
 		if (fread(&hdr, sizeof(hdr), 1, stdin) != 1)
 			err(1, "reading header");
 
-		printf("Loads: ");
+		printf("%lx Loads: ", ftell(stdin));
 		for (i = 0; i < hdr.nr_loads; i++) {
 			re = read_rip_entry(stdin);
 			print_rip_entry(re);

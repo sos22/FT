@@ -9,6 +9,10 @@
 
 #include "libvex_guest_offsets.h"
 
+#define logged_malloc(site, amount, owner) VG_(malloc)(site, amount)
+#define logged_realloc(site, ptr, oldsize, newsize, owner) VG_(realloc)(site, ptr, newsize);
+#define log_free(amt, owner) do{}while (0)
+
 #include "../ft/io.c"
 #include "../ft/rips.c"
 
@@ -26,7 +30,7 @@ static unsigned
 hash_fn(const struct rip_entry *caller, unsigned long rip)
 {
 	unsigned long val = hash_rip(caller, rip);
-	while (val > NR_HASH_HEADS)
+	while (val >= NR_HASH_HEADS)
 		val = (val % NR_HASH_HEADS) ^ (val / NR_HASH_HEADS);
 	return val;
 }
@@ -35,10 +39,11 @@ static void
 log_call(unsigned long rip, unsigned long is_call, unsigned long callee)
 {
 	const struct rip_entry *caller = &thread_callstacks[VG_(get_running_tid)()];
-	unsigned h = hash_rip(caller, rip);
+	unsigned h = hash_fn(caller, rip);
 	struct hash_entry *he;
 	unsigned i;
 
+	tl_assert(h < NR_HASH_HEADS);
 	for (he = hash_heads[h]; he && !rips_equal(&he->rip, caller, rip); he = he->next)
 		;
 	if (!he) {
