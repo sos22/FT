@@ -285,6 +285,24 @@ struct rip_entry {
 #define get_re_entry(re, idx) ((re)->content[idx])
 #endif
 
+/* Keep around for debugging */
+static void
+dump_rip_entry(const struct rip_entry *re)
+{
+	int i;
+	VG_(printf)("(");
+	for (i = 0; i < re->nr_entries; i++) {
+		if (i != 0)
+			VG_(printf)(",");
+#if USE_OOL_RIPS
+		VG_(printf)("0x%lx", get_es_entry(re, i));
+#else
+		VG_(printf)("0x%lx", re->content[i]);
+#endif
+	}
+	VG_(printf)(")");
+}
+
 static struct extending_stack thread_callstacks[VG_N_THREADS];
 
 static unsigned long
@@ -342,6 +360,27 @@ rips_equal(const struct rip_entry *re1, const struct rip_entry *re2)
 		entry1 = get_re_entry(re1, idx1);
 		entry2 = get_re_entry(re2, idx2);
 		if (entry1 != entry2)
+			return 0;
+		idx1 = next_re_idx(re1, entry1);
+		idx2 = next_re_idx(re2, entry2);
+	}
+	if (idx1 >= 0 || idx2 >= 0)
+		return 0;
+	return 1;
+}
+
+static int
+rips_equal_modulo_privateness(const struct rip_entry *re1, const struct rip_entry *re2)
+{
+	int idx1, idx2;
+	unsigned long entry1, entry2;
+
+	idx1 = re1->nr_entries - 1;
+	idx2 = re2->nr_entries - 1;
+	while (idx1 >= 0 && idx2 >= 0) {
+		entry1 = get_re_entry(re1, idx1);
+		entry2 = get_re_entry(re2, idx2);
+		if ((entry1 & ~(1ul << 63)) != (entry2 & ~(1ul << 63)))
 			return 0;
 		idx1 = next_re_idx(re1, entry1);
 		idx2 = next_re_idx(re2, entry2);
@@ -544,6 +583,22 @@ struct addr_hash_entry {
 #define NR_ADDR_HASH_HEADS 100271
 static struct addr_hash_entry *
 addr_hash_heads[NR_ADDR_HASH_HEADS];
+
+static void
+dump_rip_set(const struct rip_set *rs)
+{
+	int i;
+	VG_(printf)("Rip set: {");
+	for (i = 0; i < rs->nr_entries; i++) {
+		if (i != 0)
+			VG_(printf)("; ");
+		if (i == 0)
+			dump_rip_entry(&rs->entry0);
+		else
+			dump_rip_entry(&rs->entry1N[i-1]);
+	}
+	VG_(printf)("}\n");
+}
 
 static void
 sanity_check_set(const struct rip_set *as)
@@ -1031,6 +1086,16 @@ get_set_entry(const struct rip_set *se, int idx)
 		return &se->entry1N[idx - 1];
 }
 
+static void
+clear_private_flag(struct rip_entry *re)
+{
+#if USE_OOL_RIPS
+#error write me
+#else
+	re->content[re->nr_entries-1] &= ~(1ul << 63);
+#endif
+}
+
 static struct alias_table_entry *
 find_alias_table_entry(const struct rip_entry *re)
 {
@@ -1038,13 +1103,14 @@ find_alias_table_entry(const struct rip_entry *re)
 	unsigned head = hash % NR_AT_HEADS;
 	struct alias_table_entry *cursor;
 	for (cursor = at_heads[head]; cursor; cursor = cursor->next) {
-		if (hash == cursor->hash && rips_equal(&cursor->rip, re))
+		if (hash == cursor->hash && rips_equal_modulo_privateness(&cursor->rip, re))
 			return cursor;
 	}
 	cursor = VG_(malloc)("alias_table_entry", sizeof(*cursor));
 	cursor->next = at_heads[head];
 	cursor->hash = hash;
 	copy_rip_entry(&cursor->rip, re);
+	clear_private_flag(&cursor->rip);
 	VG_(memset)(&cursor->aliases_with, 0, sizeof(cursor->aliases_with));
 	at_heads[head] = cursor;
 	return cursor;
@@ -1058,41 +1124,6 @@ merge_rip_sets(struct rip_set *out, const struct rip_set *inp)
 		add_address_to_set(out, get_set_entry(inp, i));
 }
 
-/* Keep around for debugging */
-#if 0
-static void
-dump_rip_entry(const struct rip_entry *re)
-{
-	int i;
-	VG_(printf)("(");
-	for (i = 0; i < re->nr_entries; i++) {
-		if (i != 0)
-			VG_(printf)(",");
-#if USE_OOL_RIPS
-		VG_(printf)("0x%lx", get_es_entry(re, i));
-#else
-		VG_(printf)("0x%lx", re->content[i]);
-#endif
-	}
-	VG_(printf)("\n");
-}
-
-static void
-dump_rip_set(const struct rip_set *rs)
-{
-	int i;
-	VG_(printf)("Rip set: {");
-	for (i = 0; i < rs->nr_entries; i++) {
-		if (i != 0)
-			VG_(printf)("; ");
-		if (i == 0)
-			dump_rip_entry(&rs->entry0);
-		else
-			dump_rip_entry(&rs->entry1N[i-1]);
-	}
-	VG_(printf)("}\n");
-}
-#endif
 
 /* Add the set @s to the global aliasing table.  Zap it to an empty
    set at the same time. */
