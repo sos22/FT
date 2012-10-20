@@ -793,6 +793,7 @@ add_current_address_to_set(struct rip_set *set, unsigned long _addr, int private
 static unsigned
 hash_address(unsigned long addr)
 {
+	addr /= 32;
 	while (addr > NR_ADDR_HASH_HEADS)
 		addr = (addr % NR_ADDR_HASH_HEADS) ^ (addr / NR_ADDR_HASH_HEADS);
 	return addr;
