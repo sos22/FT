@@ -840,7 +840,7 @@ sanity_check_addr_hash(void)
 }
 
 static void
-log_store(unsigned long rip, unsigned long addr, unsigned size, int private)
+log_store(unsigned long rip, unsigned long addr, int private)
 {
 	struct addr_hash_entry *ahe = find_addr_hash_entry(addr);
 	add_current_address_to_set(&ahe->content.stores, rip, private);
@@ -876,7 +876,7 @@ do_store(unsigned long addr, unsigned long data, unsigned long size, unsigned lo
 	int stack = is_stack(addr);
 	int private = stack || memory_location_is_private(addr);
 	if (!stack)
-		log_store(rip, addr, size, private);
+		log_store(rip, addr, private || !i_am_multithreaded);
 	if (size == 8 && !private)
 		make_memory_location_public(data);
 	VG_(memcpy)( (void *)addr, &data, size);
@@ -885,10 +885,8 @@ do_store(unsigned long addr, unsigned long data, unsigned long size, unsigned lo
 static void
 do_store2(unsigned long addr, unsigned long x1, unsigned long x2, unsigned long rip)
 {
-	if (!is_stack(addr))
-		log_store(rip, addr, 16, memory_location_is_private(addr));
-	((unsigned long *)addr)[0] = x1;
-	((unsigned long *)addr)[1] = x2;
+	do_store(addr, x1, 8, rip);
+	do_store(addr + 8, x2, 8, rip);
 }
 
 static void
@@ -898,7 +896,7 @@ do_log_load(unsigned long addr, unsigned long rip)
 	if (is_stack(addr))
 		return;
 	ahe = find_addr_hash_entry(addr);
-	add_current_address_to_set(&ahe->content.loads, rip, memory_location_is_private(addr));
+	add_current_address_to_set(&ahe->content.loads, rip, memory_location_is_private(addr) || !i_am_multithreaded);
 	sanity_check_addr_hash();
 }
 
@@ -1241,7 +1239,7 @@ refresh_tags(void *base, unsigned long size)
 }
 
 struct memory_tree_entry {
-	int private;
+	ThreadId tid;
 	unsigned long start;
 	unsigned long end;
 	struct memory_tree_entry *prev;
@@ -1278,7 +1276,7 @@ static struct memory_tree_entry *
 new_memory_tree_entry(unsigned long start, unsigned long end)
 {
 	struct memory_tree_entry *mte = VG_(malloc)("mte_entry", sizeof(*mte));
-	mte->private = 1;
+	mte->tid = VG_(get_running_tid)();
 	mte->start = start;
 	mte->end = end;
 	mte->prev = NULL;
@@ -1316,6 +1314,7 @@ set_memory_private(unsigned long start, unsigned long end)
 		tl_assert(0);
 	}
 	*mtep = new_memory_tree_entry(start, end);
+	(*mtep)->tid = VG_(get_running_tid)();
 	sanity_check_memory_tree();
 	return;
 }
@@ -1336,6 +1335,10 @@ release_memory_range(unsigned long start, unsigned long end)
 		}
 		tl_assert(mte);
 		if (mte->start == start || mte->end == end) {
+			if (mte->tid != VG_INVALID_THREADID &&
+			    mte->tid != VG_(get_running_tid)())
+				VG_(printf)("DOOM: [%lx, %lx) should be private to %d, but was released from %d\n",
+					    start, end, mte->tid, VG_(get_running_tid)());
 			tl_assert(start == mte->start);
 			tl_assert(end == mte->end);
 			if (mte->prev) {
@@ -1389,19 +1392,18 @@ memory_location_is_private(unsigned long addr)
 	struct memory_tree_entry *r, *rp, *rpp, *rpps, *rps, *rpsp,
 		*rpss, *rs, *rsp, *rss, *rspp, *rsps, *rssp;
 
-	/* If we're not multithreaded then we consider all memory
-	   locations to be private.  We still need to do all the rest
-	   of the machinery, though, so that type tracking works. */
-	if (!i_am_multithreaded)
-		return 1;
-
 	mtep = &memory_root;
 	while (1) {
 		mte = *mtep;
 		if (!mte)
 			return 0;
-		if (addr >= mte->start && addr < mte->end)
-			return mte->private;
+		if (addr >= mte->start && addr < mte->end) {
+			if (mte->tid != VG_INVALID_THREADID &&
+			    mte->tid != VG_(get_running_tid)())
+				VG_(printf)("DOOM: lookup %lx: found [%lx, %lx) for thread %d, but we are thread %d?\n",
+					    addr, mte->start, mte->end, mte->tid, VG_(get_running_tid)());
+			return mte->tid != VG_INVALID_THREADID;
+		}
 		/* Splay */
 		r = mte;
 		if (addr < mte->start) {
@@ -1465,6 +1467,7 @@ memory_location_is_private(unsigned long addr)
 			}
 		}
 	}
+	asm("ud2\n");
 	return 0;
 }
 
@@ -1479,7 +1482,7 @@ make_memory_location_public(unsigned long addr)
 		else if (addr >= mte->end)
 			mte = mte->next;
 		else {
-			mte->private = 0;
+			mte->tid = VG_INVALID_THREADID;
 			return;
 		}
 	}
