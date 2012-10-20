@@ -803,12 +803,16 @@ static struct addr_hash_entry *
 find_addr_hash_entry(unsigned long addr)
 {
 	unsigned hash;
-	struct addr_hash_entry *cursor;
+	struct addr_hash_entry *cursor, **pprev;
 	addr -= addr % 8;
 	hash = hash_address(addr);
-	for (cursor = addr_hash_heads[hash]; cursor && cursor->addr != addr; cursor = cursor->next)
+	pprev = &addr_hash_heads[hash];
+	for (cursor = *pprev; cursor && cursor->addr != addr; pprev = &cursor->next, cursor = *pprev)
 		;
 	if (cursor) {
+		*pprev = cursor->next;
+		cursor->next = addr_hash_heads[hash];
+		addr_hash_heads[hash] = cursor;
 		return cursor;
 	}
 	cursor = VG_(malloc)("addr_hash_entry", sizeof(*cursor));
