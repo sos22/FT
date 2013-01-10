@@ -12,6 +12,7 @@
 #include "pub_tool_threadstate.h"
 #include "pub_tool_xarray.h"
 #include "pub_tool_clientstate.h"
+#include "pub_tool_options.h"
 
 #include "libvex_guest_offsets.h"
 
@@ -29,6 +30,8 @@ struct write_file {
 	unsigned buf_prod;
 	unsigned char buf[1024];
 };
+
+static struct write_file output_file;
 
 static void do_store(unsigned long addr, unsigned long data, unsigned long size,
 		     unsigned long rip);
@@ -874,11 +877,11 @@ static void
 do_store(unsigned long addr, unsigned long data, unsigned long size, unsigned long rip)
 {
 	int stack = is_stack(addr);
-	int private = stack || memory_location_is_private(addr);
-	if (!stack)
-		log_store(rip, addr, private || !i_am_multithreaded);
-	if (size == 8 && !private)
-		make_memory_location_public(data);
+	if (!stack) {
+		log_store(rip, addr, memory_location_is_private(addr) || !i_am_multithreaded);
+		if (size == 8)
+			make_memory_location_public(data);
+	}
 	VG_(memcpy)( (void *)addr, &data, size);
 }
 
@@ -1053,6 +1056,8 @@ log_loads(IRSB *inp)
 static void
 ft2_post_clo_init(void)
 {
+	if (!output_file.fd)
+		VG_(tool_panic)((Char *)"need to know where to put the output!\n");
 }
 
 static IRSB *
@@ -1167,11 +1172,9 @@ ft2_fini(Int exitcode)
 	int i;
 	struct addr_hash_entry *ahe;
 	struct alias_table_entry *ate;
-	struct write_file output;
 	Char buf[128];
 
 	VG_(printf)("ft2_fini() starts\n");
-	VG_(printf)("I am %s\n", VG_(args_the_exename));
 	sanity_check_addr_hash();
 	VG_(printf)("Done sanity check\b");
 
@@ -1181,14 +1184,6 @@ ft2_fini(Int exitcode)
 
 	VG_(printf)("Done folding\n");
 
-	x = 0;
-	do {
-		x++;
-		VG_(sprintf)(buf, "/tmp/types%d.dat", x);
-	} while (open_write_file(&output, buf) != 0);
-
-	VG_(printf)("Dumping results to %s\n", buf);
-
 	for (x = 0; x < NR_AT_HEADS; x++) {
 		for (ate = at_heads[x]; ate; ate = ate->next) {
 			if (ate->aliases_with.stores.nr_entries > 0 ||
@@ -1196,18 +1191,18 @@ ft2_fini(Int exitcode)
 				struct hdr hdr;
 				hdr.nr_loads = ate->aliases_with.loads.nr_entries;
 				hdr.nr_stores = ate->aliases_with.stores.nr_entries;
-				write_file(&output, &hdr, sizeof(hdr));
-				write_rip_entry(&output, &ate->rip);
+				write_file(&output_file, &hdr, sizeof(hdr));
+				write_rip_entry(&output_file, &ate->rip);
 				for (i = 0; i < ate->aliases_with.loads.nr_entries; i++)
-					write_rip_entry(&output,
+					write_rip_entry(&output_file,
 							get_set_entry(&ate->aliases_with.loads, i));
 				for (i = 0; i < ate->aliases_with.stores.nr_entries; i++)
-					write_rip_entry(&output,
+					write_rip_entry(&output_file,
 							get_set_entry(&ate->aliases_with.stores, i));
 			}
 		}
 	}
-	close_write_file(&output);
+	close_write_file(&output_file);
 
 	VG_(printf)("Finished writing results\n");
 
@@ -1581,6 +1576,36 @@ ft2_create_thread(ThreadId tid, ThreadId child)
 }
 
 static void
+ft2_print_usage(void)
+{
+	VG_(printf)("\t--output=<fname>     Where to dump the type file\n");
+}
+
+static void
+ft2_print_debug_usage(void)
+{
+}
+
+static Bool
+ft2_process_command_line_option(Char *opt)
+{
+	Char *pathname;
+	int err;
+
+	if (VG_CLO_STREQN(VG_(strlen)("--output")+1, opt, "--output=")) {
+		pathname = opt + VG_(strlen)("--output") + 1;
+		err = open_write_file(&output_file, pathname);
+		if (err) {
+			VG_(printf)("Cannot open %s: %d\n", pathname, err);
+			VG_(tool_panic)("Cannot open database");
+		}
+		return True;
+	} else {
+		return False;
+	}
+}
+
+static void
 ft2_pre_clo_init(void)
 {
 	VG_(details_name)("FT2");
@@ -1604,6 +1629,10 @@ ft2_pre_clo_init(void)
 				      ft2_realloc,
 				      0);
 	VG_(needs_client_requests)(ft2_client_request);
+
+	VG_(needs_command_line_options) (ft2_process_command_line_option,
+					 ft2_print_usage,
+					 ft2_print_debug_usage);
 }
 
 VG_DETERMINE_INTERFACE_VERSION(ft2_pre_clo_init)
