@@ -22,6 +22,7 @@
 
 #define CHECK_SANITY 0
 #define MAX_CONTEXT 1
+#define NOISY 0
 
 struct write_file {
 	int fd;
@@ -1293,6 +1294,11 @@ set_memory_private(unsigned long start, unsigned long end)
 
 	sanity_check_memory_tree();
 
+	if (NOISY) {
+		VG_(printf)("%d: set_memory_private(%lx, %lx)\n",
+			    VG_(get_running_tid)(), start, end);
+	}
+
 	mtep = &memory_root;
 	while (*mtep) {
 		mte = *mtep;
@@ -1330,10 +1336,17 @@ release_memory_range(unsigned long start, unsigned long end)
 		}
 		tl_assert(mte);
 		if (mte->start == start || mte->end == end) {
+			if (NOISY && mte->tid != VG_INVALID_THREADID) {
+				VG_(printf)("%d: release_memory_range(%lx, %lx)\n",
+					    VG_(get_running_tid)(),
+					    start,
+					    end);
+			}
 			if (mte->tid != VG_INVALID_THREADID &&
-			    mte->tid != VG_(get_running_tid)())
+			    mte->tid != VG_(get_running_tid)()) {
 				VG_(printf)("DOOM: [%lx, %lx) should be private to %d, but was released from %d\n",
 					    start, end, mte->tid, VG_(get_running_tid)());
+			}
 			tl_assert(start == mte->start);
 			tl_assert(end == mte->end);
 			if (mte->prev) {
@@ -1394,9 +1407,10 @@ memory_location_is_private(unsigned long addr)
 			return 0;
 		if (addr >= mte->start && addr < mte->end) {
 			if (mte->tid != VG_INVALID_THREADID &&
-			    mte->tid != VG_(get_running_tid)())
+			    mte->tid != VG_(get_running_tid)()) {
 				VG_(printf)("DOOM: lookup %lx: found [%lx, %lx) for thread %d, but we are thread %d?\n",
 					    addr, mte->start, mte->end, mte->tid, VG_(get_running_tid)());
+			}
 			return mte->tid != VG_INVALID_THREADID;
 		}
 		/* Splay */
@@ -1477,6 +1491,13 @@ make_memory_location_public(unsigned long addr)
 		else if (addr >= mte->end)
 			mte = mte->next;
 		else {
+			if (NOISY) {
+				VG_(printf)("%d: make_memory_location_public(%lx): %lx, %lx\n",
+					    VG_(get_running_tid)(),
+					    addr,
+					    mte->start,
+					    mte->end);
+			}
 			mte->tid = VG_INVALID_THREADID;
 			return;
 		}
