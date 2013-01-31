@@ -33,6 +33,7 @@ struct write_file {
 };
 
 static struct write_file output_file;
+static int stack_is_private = 1;
 
 static void do_store(unsigned long addr, unsigned long data, unsigned long size,
 		     unsigned long rip);
@@ -867,7 +868,12 @@ get_current_thread_stack_data(void)
 static int
 is_stack(unsigned long addr)
 {
-	struct stack_data *sd = get_current_thread_stack_data();
+	struct stack_data *sd;
+	if (!stack_is_private) {
+		return 0;
+	}
+
+	sd = get_current_thread_stack_data();
 	if (addr >= sd->start && addr <= sd->end)
 		return 1;
 	else
@@ -1173,7 +1179,6 @@ ft2_fini(Int exitcode)
 	int i;
 	struct addr_hash_entry *ahe;
 	struct alias_table_entry *ate;
-	Char buf[128];
 
 	VG_(printf)("ft2_fini() starts\n");
 	sanity_check_addr_hash();
@@ -1621,9 +1626,11 @@ ft2_process_command_line_option(Char *opt)
 			VG_(tool_panic)("Cannot open database");
 		}
 		return True;
-	} else {
+	} else VG_BOOL_CLO(opt, "--stack-private", stack_is_private)
+	else {
 		return False;
 	}
+	return True;
 }
 
 static void
