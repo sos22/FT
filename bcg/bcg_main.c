@@ -14,63 +14,72 @@
 #define log_free(amt, owner) do{}while (0)
 
 #include "../ft/io.c"
-#include "../ft/rips.c"
 
+/* The hash table is pretty much a mapping from indirect call and
+   branch instructions to the sets of instructions which they might
+   target. */
 struct hash_entry {
 	struct hash_entry *next;
-	struct rip_entry rip;
+	/* This gets bitwise or'd into ->src if this is a call
+	 * instruction */
+#define HE_IS_CALL (1ul << 63)
+	unsigned long src;
 	unsigned nr_entries;
 	unsigned nr_entries_allocated;
-	unsigned long *entries;
+	unsigned long *dest;
 };
 #define NR_HASH_HEADS 65537
 static struct hash_entry *hash_heads[NR_HASH_HEADS];
 
 static unsigned
-hash_fn(const struct rip_entry *caller, unsigned long rip)
+hash_fn(unsigned long rip)
 {
-	unsigned long val = hash_rip(caller, rip);
+	unsigned long val = rip / 8;
 	while (val >= NR_HASH_HEADS)
 		val = (val % NR_HASH_HEADS) ^ (val / NR_HASH_HEADS);
 	return val;
 }
 
 static void
-log_call(unsigned long rip, unsigned long is_call, unsigned long callee)
+log_call(unsigned long src, unsigned long is_call, unsigned long dest)
 {
-	const struct rip_entry *caller = &thread_callstacks[VG_(get_running_tid)()];
-	unsigned h = hash_fn(caller, rip);
+	unsigned h = hash_fn(src);
 	struct hash_entry *he;
 	unsigned i;
 
+	if (is_call) {
+		src |= HE_IS_CALL;
+	}
 	tl_assert(h < NR_HASH_HEADS);
-	for (he = hash_heads[h]; he && !rips_equal(&he->rip, caller, rip); he = he->next)
+	for (he = hash_heads[h]; he && src != he->src; he = he->next) {
 		;
+	}
 	if (!he) {
 		he = VG_(malloc)("hash_entry", sizeof(*he));
 		he->next = hash_heads[h];
-		copy_rip_entry(&he->rip, caller, rip);
+		he->src = src;
 		he->nr_entries = 0;
-		he->nr_entries_allocated = 4;
-		he->entries = VG_(malloc)("hash_entry->entries",
-					  sizeof(he->entries[0]) * he->nr_entries_allocated);
+		he->nr_entries_allocated = 7;
+		he->dest = VG_(malloc)("hash_entry->entries",
+				       sizeof(he->dest[0]) * he->nr_entries_allocated);
 		hash_heads[h] = he;
+	} else {
+		for (i = 0; i < he->nr_entries; i++) {
+			if (he->dest[i] == dest) {
+				return;
+			}
+		}
+		if (he->nr_entries == he->nr_entries_allocated) {
+			unsigned long *t;
+			he->nr_entries_allocated += 16;
+			t = VG_(malloc)("hash_entry->entries2",
+					sizeof(he->dest[0]) * he->nr_entries_allocated);
+			VG_(memcpy)(t, he->dest, sizeof(he->dest[0]) * he->nr_entries);
+			VG_(free)(he->dest);
+			he->dest = t;
+		}
 	}
-
-	callee |= (is_call << 63);
-	for (i = 0; i < he->nr_entries; i++)
-		if (he->entries[i] == callee)
-			return;
-	if (he->nr_entries == he->nr_entries_allocated) {
-		unsigned long *t;
-		he->nr_entries_allocated += 16;
-		t = VG_(malloc)("hash_entry->entries2",
-				sizeof(he->entries[0]) * he->nr_entries_allocated);
-		VG_(memcpy)(t, he->entries, sizeof(he->entries[0]) * he->nr_entries);
-		VG_(free)(he->entries);
-		he->entries = t;
-	}
-	he->entries[he->nr_entries] = callee;
+	he->dest[he->nr_entries] = dest;
 	he->nr_entries++;
 }
 
@@ -88,7 +97,6 @@ bcg_instrument(VgCallbackClosure* closure,
 	       IRType hWordTy)
 {
 	unsigned long rip = 0;
-	unsigned long endRip;
 	int i;
 
 	if (bb->jumpkind != Ijk_Ret &&
@@ -98,7 +106,6 @@ bcg_instrument(VgCallbackClosure* closure,
 		for (i = bb->stmts_used - 1; i >= 0; i--) {
 			if (bb->stmts[i]->tag == Ist_IMark) {
 				rip = bb->stmts[i]->Ist.IMark.addr;
-				endRip = rip + bb->stmts[i]->Ist.IMark.len;
 				break;
 			}
 		}
@@ -123,8 +130,6 @@ bcg_instrument(VgCallbackClosure* closure,
 						      bb->next))));
 	}
 
-	maintain_call_stack(bb);
-
 	return bb;
 }
 
@@ -144,10 +149,10 @@ bcg_fini(Int exitcode)
 
 	for (x = 0; x < NR_HASH_HEADS; x++) {
 		for (he = hash_heads[x]; he; he = he->next) {
-			write_rip_entry(&output, &he->rip);
 			tl_assert(he->nr_entries > 0);
+			write_file(&output, &he->src, sizeof(he->src));
 			write_file(&output, &he->nr_entries, sizeof(he->nr_entries));
-			write_file(&output, he->entries, sizeof(he->entries[0]) * he->nr_entries);
+			write_file(&output, he->dest, sizeof(he->dest[0]) * he->nr_entries);
 		}
 	}
 	close_write_file(&output);
