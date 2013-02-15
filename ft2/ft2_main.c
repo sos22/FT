@@ -1206,103 +1206,6 @@ make_memory_location_public(unsigned long addr)
 	}
 }
 
-struct alloc_hdr {
-	unsigned long real_size;
-	void *real_start;
-};
-
-static void
-ft2_free(ThreadId tid, void *p)
-{
-	struct alloc_hdr *hdr;
-	if (!p) {
-		return;
-	}
-	hdr = p;
-	hdr--;
-	release_memory_range((unsigned long)hdr->real_start,
-			     (unsigned long)hdr->real_start + hdr->real_size);
-	VG_(cli_free)(hdr->real_start);
-}
-
-static void *
-ft2_memalign(ThreadId tid, SizeT align, SizeT n)
-{
-	unsigned long raw_block;
-	unsigned long aligned_block;
-	struct alloc_hdr *hdr;
-
-	if (align < sizeof(struct alloc_hdr)) {
-		align = sizeof(struct alloc_hdr);
-	}
-	n += align + sizeof(struct alloc_hdr);
-
-	raw_block = (unsigned long)VG_(cli_malloc)(sizeof(struct alloc_hdr), n);
-	if (!raw_block) {
-		return NULL;
-	}
-	/* Reserve space for our header */
-	aligned_block = raw_block + sizeof(struct alloc_hdr);
-	/* And now skip to the right alignment */
-	/* (You could do this with masks if you knew align were a
-	   power of two, but we don't, so we can't.) */
-	if (aligned_block % align) {
-		aligned_block = aligned_block -
-			(aligned_block % align) +
-			align;
-	}
-	hdr = (struct alloc_hdr *)aligned_block - 1;
-	hdr->real_size = n;
-	hdr->real_start = raw_block;
-
-	refresh_tags((void *)hdr->real_start, hdr->real_size);
-	set_memory_private(raw_block, raw_block + hdr->real_size);
-	return aligned_block;
-}
-
-static void *
-ft2_malloc(ThreadId tid, SizeT n)
-{
-	return ft2_memalign(tid, 0, n);
-}
-
-static void *
-ft2_calloc(ThreadId tid, SizeT nmemb, SizeT size1)
-{
-	void *buf = ft2_malloc(tid, nmemb * size1);
-	if (buf) {
-		VG_(memset)(buf, 0, nmemb * size1);
-		refresh_tags(buf, nmemb * size1);
-	}
-	return buf;
-}
-
-static void *
-ft2_realloc(ThreadId tid, void *p, SizeT new_size)
-{
-	void *n;
-	unsigned long old_size;
-	struct alloc_hdr *hdr;
-
-	if (new_size == 0) {
-		ft2_free(tid, p);
-		return NULL;
-	}
-	if (p == NULL)
-		return ft2_malloc(tid, new_size);
-	n = ft2_malloc(tid, new_size);
-	hdr = p;
-	old_size = (unsigned long)hdr->real_start +
-		hdr->real_size -
-		(unsigned long)p;
-	if (old_size < new_size)
-		VG_(memcpy)(n, p, old_size);
-	else
-		VG_(memcpy)(n, p, new_size);
-	ft2_free(tid, p);
-	return n;
-}
-
 static Bool
 ft2_client_request(ThreadId tid, UWord *arg_block, UWord *ret)
 {
@@ -1357,8 +1260,121 @@ ft2_process_command_line_option(Char *opt)
 	return True;
 }
 
-static void
-ft2_pre_clo_init(void)
+
+
+//VG_DETERMINE_INTERFACE_VERSION(ft2_pre_clo_init)
+
+#include "pub_tool_hashtable.h"
+
+//------------------------------------------------------------//
+//--- Heap management                                      ---//
+//------------------------------------------------------------//
+
+// Metadata for heap blocks.  Each one contains a pointer to a bottom-XPt,
+// which is a foothold into the XCon at which it was allocated.  From
+// HP_Chunks, XPt 'space' fields are incremented (at allocation) and
+// decremented (at deallocation).
+//
+// Nb: first two fields must match core's VgHashNode.
+typedef
+   struct _HP_Chunk {
+      struct _HP_Chunk* next;
+      Addr              data;       // Ptr to actual block
+      SizeT             req_szB;    // Size requested
+   }
+   HP_Chunk;
+
+static VgHashTable malloc_list  = NULL;   // HP_Chunks
+
+static void *
+new_block(SizeT req_szB, SizeT req_alignB )
+{
+   HP_Chunk* hc;
+   void *p;
+
+   if (req_szB < 0) return NULL;
+
+   p = VG_(cli_malloc)( req_alignB, req_szB );
+   if (!p) {
+     return NULL;
+   }
+
+   // Make new HP_Chunk node, add to malloc_list
+   hc           = VG_(malloc)("ms.main.nb.1", sizeof(HP_Chunk));
+   hc->req_szB  = req_szB;
+   hc->data     = (Addr)p;
+   VG_(HT_add_node)(malloc_list, hc);
+
+   refresh_tags(p, req_szB);
+   set_memory_private((unsigned long)p, (unsigned long)p + req_szB);
+
+   return p;
+}
+
+static void *
+ms_memalign ( ThreadId tid, SizeT alignB, SizeT szB )
+{
+	return new_block(szB, alignB);
+}
+
+static void *
+ms_malloc ( ThreadId tid, SizeT szB )
+{
+	return ms_memalign(tid, VG_(clo_alignment), szB);
+}
+
+static void *
+ms_calloc ( ThreadId tid, SizeT m, SizeT szB )
+{
+	void *r = ms_memalign(tid, VG_(clo_alignment), m*szB);
+	if (r) {
+		VG_(memset)(r, 0, m * szB);
+	}
+	return r;
+}
+
+static void ms_free ( ThreadId tid, void* p )
+{
+	HP_Chunk *hc = VG_(HT_remove)(malloc_list, (UWord)p);
+	release_memory_range((unsigned long)p,
+			     (unsigned long)p + hc->req_szB);
+	VG_(free)( hc );
+	VG_(cli_free)( p );
+}
+
+static void* ms_realloc ( ThreadId tid, void* p_old, SizeT new_szB )
+{
+	void *p_new = VG_(cli_malloc)(VG_(clo_alignment), new_szB);
+	HP_Chunk *hc;
+
+	if (!p_new) {
+		return NULL;
+	}
+
+	hc = VG_(HT_remove)(malloc_list, (UWord)p_old);
+
+	release_memory_range((unsigned long)p_old,
+			     (unsigned long)p_old + hc->req_szB);
+
+	if (hc->req_szB < new_szB) {
+		VG_(memcpy)(p_new, p_old, hc->req_szB);
+	} else {
+		VG_(memcpy)(p_new, p_old, new_szB);
+	}
+	VG_(cli_free)(p_old);
+
+	hc->data     = (Addr)p_new;
+	hc->req_szB  = new_szB;
+
+	VG_(HT_add_node)(malloc_list, hc);
+
+	refresh_tags(p_new, new_szB);
+	set_memory_private((unsigned long)p_new, (unsigned long)p_new + new_szB);
+
+	return p_new;
+}
+
+static void ft2_pre_clo_init(void)
 {
 	VG_(details_name)("FT2");
 	VG_(details_version)(NULL);
@@ -1370,21 +1386,23 @@ ft2_pre_clo_init(void)
 
 	VG_(track_pre_thread_ll_create)(ft2_create_thread);
 
-	VG_(needs_malloc_replacement)(ft2_malloc,
-				      ft2_malloc,
-				      ft2_malloc,
-				      ft2_memalign,
-				      ft2_calloc,
-				      ft2_free,
-				      ft2_free,
-				      ft2_free,
-				      ft2_realloc,
-				      0);
-	VG_(needs_client_requests)(ft2_client_request);
-
 	VG_(needs_command_line_options) (ft2_process_command_line_option,
 					 ft2_print_usage,
 					 ft2_print_debug_usage);
+	VG_(needs_malloc_replacement)  (ms_malloc,
+					ms_malloc,
+					ms_malloc,
+					ms_memalign,
+					ms_calloc,
+					ms_free,
+					ms_free,
+					ms_free,
+					ms_realloc,
+					0 );
+
+	VG_(needs_client_requests)(ft2_client_request);
+
+	malloc_list = VG_(HT_construct)( "Massif's malloc list" );
 }
 
 VG_DETERMINE_INTERFACE_VERSION(ft2_pre_clo_init)
