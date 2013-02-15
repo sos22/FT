@@ -876,6 +876,7 @@ ft2_fini(Int exitcode)
 	int i;
 	struct addr_hash_entry *ahe;
 	struct alias_table_entry *ate;
+	unsigned long magic;
 
 	VG_(printf)("ft2_fini() starts\n");
 	sanity_check_addr_hash();
@@ -887,6 +888,8 @@ ft2_fini(Int exitcode)
 
 	VG_(printf)("Done folding\n");
 
+	magic = 0x1122334455;
+	write_file(&output_file, &magic, sizeof(magic));
 	for (x = 0; x < NR_AT_HEADS; x++) {
 		for (ate = at_heads[x]; ate; ate = ate->next) {
 			if (ate->aliases_with.stores.nr_entries > 0 ||
