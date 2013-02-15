@@ -267,29 +267,10 @@ close_write_file(struct write_file *wf)
 	VG_(close)(wf->fd);
 }
 
-#define NR_INLINE_RIPS 8
-
-struct extending_stack {
-	unsigned nr_entries;
-	unsigned nr_entries_allocated;
-	unsigned long content[NR_INLINE_RIPS];
-	unsigned long *out_of_line_content;
-};
-
 struct rip_entry {
 	unsigned long content:63;
 	unsigned long is_private:1;
 };
-
-static void
-dump_rip_entry(const struct rip_entry *what)
-{
-	VG_(printf)("0x%lx%c",
-		    (unsigned long)what->content,
-		    what->is_private ? 'P' : 'S');
-}
-
-static struct extending_stack thread_callstacks[VG_N_THREADS];
 
 static unsigned
 hash_rip(const struct rip_entry *re)
@@ -322,106 +303,9 @@ copy_rip_entry(struct rip_entry *dest, const struct rip_entry *src)
 }
 
 static void
-push_call_stack(struct extending_stack *caller, unsigned long rip)
-{
-	if (caller->nr_entries < NR_INLINE_RIPS) {
-		caller->content[caller->nr_entries] = rip;
-	} else {
-		if (caller->nr_entries >= NR_INLINE_RIPS + caller->nr_entries_allocated) {
-			caller->nr_entries_allocated += 32;
-			caller->out_of_line_content =
-				VG_(realloc)("rip_entry_out_of_line",
-					     caller->out_of_line_content,
-					     caller->nr_entries_allocated * sizeof(caller->out_of_line_content[0]));
-		}
-		tl_assert(caller->nr_entries - NR_INLINE_RIPS < caller->nr_entries_allocated);
-		caller->out_of_line_content[caller->nr_entries - NR_INLINE_RIPS] = rip;
-	}
-	caller->nr_entries++;
-	return;
-}
-static void
-_push_call_stack(unsigned long rip)
-{
-	push_call_stack(&thread_callstacks[VG_(get_running_tid)()], rip);
-}
-
-static void
-pop_call_stack(struct extending_stack *caller, unsigned long to)
-{
-	if (caller->nr_entries > 0) {
-		unsigned long retaddr;
-		if (caller->nr_entries - 1 >= NR_INLINE_RIPS)
-			retaddr = caller->out_of_line_content[caller->nr_entries - NR_INLINE_RIPS - 1];
-		else
-			retaddr = caller->content[caller->nr_entries - 1];
-		if (retaddr != to)
-			VG_(printf)("Wanted to return to %lx!\n", retaddr);
-		caller->nr_entries--;
-	}
-}
-static void
-_pop_call_stack(unsigned long rip)
-{
-	pop_call_stack(&thread_callstacks[VG_(get_running_tid)()], rip);
-}
-
-static void
 write_rip_entry(struct write_file *output, const struct rip_entry *re)
 {
 	write_file(output, re, sizeof(*re));
-}
-
-static void
-maintain_call_stack(IRSB *bb)
-{
-	unsigned long rip = 0;
-	unsigned long endRip;
-	int i;
-	IRTemp tmp;
-
-	if (bb->jumpkind == Ijk_Call) {
-		for (i = bb->stmts_used - 1; !rip && i >= 0; i--)
-			if (bb->stmts[i]->tag == Ist_IMark) {
-				rip = bb->stmts[i]->Ist.IMark.addr;
-				endRip = rip + bb->stmts[i]->Ist.IMark.len;
-			}
-		if (bb->next->tag == Iex_RdTmp) {
-			tmp = bb->next->Iex.RdTmp.tmp;
-		} else {
-			tmp = newIRTemp(bb->tyenv, Ity_I64);
-			addStmtToIRSB(bb,
-				      IRStmt_WrTmp(tmp, bb->next));
-			bb->next = IRExpr_RdTmp(tmp);
-		}
-		addStmtToIRSB(bb,
-			      IRStmt_Dirty(
-				      unsafeIRDirty_0_N(
-					      0,
-					      "push_call_stack",
-					      _push_call_stack,
-					      mkIRExprVec_1(
-						      IRExpr_Const(IRConst_U64(endRip))))));
-	}
-	if (bb->jumpkind == Ijk_Ret) {
-		if (bb->next->tag == Iex_RdTmp) {
-			tmp = bb->next->Iex.RdTmp.tmp;
-		} else {
-			tmp = newIRTemp(bb->tyenv, Ity_I64);
-			addStmtToIRSB(bb,
-				      IRStmt_WrTmp(tmp, bb->next));
-			bb->next = IRExpr_RdTmp(tmp);
-		}
-		addStmtToIRSB(bb,
-			      IRStmt_Dirty(
-				      unsafeIRDirty_0_N(
-					      0,
-					      "pop_call_stack",
-					      _pop_call_stack,
-					      mkIRExprVec_1(
-						      IRExpr_RdTmp(tmp)
-						      ))));
-	}
 }
 
 static int i_am_multithreaded;
@@ -901,7 +785,6 @@ ft2_instrument(VgCallbackClosure* closure,
 {
 	IRSB *b;
 	b = log_loads(log_stores(bb));
-	maintain_call_stack(b);
 	return b;
 }
 
