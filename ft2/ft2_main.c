@@ -21,7 +21,6 @@
 #define PAGE_SIZE (4096ul)
 
 #define CHECK_SANITY 0
-#define MAX_CONTEXT 1
 #define NOISY 0
 
 struct write_file {
@@ -277,174 +276,49 @@ struct extending_stack {
 	unsigned long *out_of_line_content;
 };
 
-#if MAX_CONTEXT > NR_INLINE_RIPS
-#define USE_OOL_RIPS 1
-#define rip_entry extending_stack
-#define get_re_entry get_es_entry
-#else
-#define USE_OOL_RIPS 0
 struct rip_entry {
-	unsigned nr_entries;
-	unsigned long content[MAX_CONTEXT];
+	unsigned long content:63;
+	unsigned long is_private:1;
 };
-#define get_re_entry(re, idx) ((re)->content[idx])
-#endif
 
-/* Keep around for debugging */
 static void
-dump_rip_entry(const struct rip_entry *re)
+dump_rip_entry(const struct rip_entry *what)
 {
-	int i;
-	VG_(printf)("(");
-	for (i = 0; i < re->nr_entries; i++) {
-		if (i != 0)
-			VG_(printf)(",");
-#if USE_OOL_RIPS
-		VG_(printf)("0x%lx", get_es_entry(re, i));
-#else
-		VG_(printf)("0x%lx", re->content[i]);
-#endif
-	}
-	VG_(printf)(")");
+	VG_(printf)("0x%lx%c",
+		    (unsigned long)what->content,
+		    what->is_private ? 'P' : 'S');
 }
 
 static struct extending_stack thread_callstacks[VG_N_THREADS];
 
-static unsigned long
-get_es_entry(const struct extending_stack *re, unsigned idx)
-{
-	if (idx >= NR_INLINE_RIPS)
-		return re->out_of_line_content[idx-NR_INLINE_RIPS];
-	else
-		return re->content[idx];
-}
-
-/* advance to the next one in a way which avoids considering any
-   cycles in the stack (e.g. recursive functions). */
-static int
-next_re_idx(const struct rip_entry *re, unsigned long entry)
-{
-	unsigned long entry2;
-	int y;
-
-	for (y = 0; y < re->nr_entries; y++) {
-		entry2 = get_re_entry(re, y);
-		if (entry2 == entry)
-			return y - 1;
-	}
-	tl_assert(0);
-	return -1;
-}
-
 static unsigned
 hash_rip(const struct rip_entry *re)
 {
-	unsigned long addr = 0;
-	unsigned long entry;
-	int x;
-	int nr_inline = re->nr_entries;
-	if (nr_inline > NR_INLINE_RIPS)
-		nr_inline = NR_INLINE_RIPS;
-	for (x = re->nr_entries - 1; x >= 0; ) {
-		entry = get_re_entry(re, x);
-		addr = ((addr << 31) | (addr >> 33)) ^ entry;
-		x = next_re_idx(re, entry);
-	}
-	return addr;
+	return (re->content >> 33) ^ (re->content) ^ re->is_private;
 }
 
 static int
 rips_equal(const struct rip_entry *re1, const struct rip_entry *re2)
 {
-	int idx1, idx2;
-	unsigned long entry1, entry2;
-
-	idx1 = re1->nr_entries - 1;
-	idx2 = re2->nr_entries - 1;
-	while (idx1 >= 0 && idx2 >= 0) {
-		entry1 = get_re_entry(re1, idx1);
-		entry2 = get_re_entry(re2, idx2);
-		if (entry1 != entry2)
-			return 0;
-		idx1 = next_re_idx(re1, entry1);
-		idx2 = next_re_idx(re2, entry2);
-	}
-	if (idx1 >= 0 || idx2 >= 0)
-		return 0;
-	return 1;
+	return re1->content == re2->content && re1->is_private == re2->is_private;
 }
 
 static int
 rips_equal_modulo_privateness(const struct rip_entry *re1, const struct rip_entry *re2)
 {
-	int idx1, idx2;
-	unsigned long entry1, entry2;
-
-	idx1 = re1->nr_entries - 1;
-	idx2 = re2->nr_entries - 1;
-	while (idx1 >= 0 && idx2 >= 0) {
-		entry1 = get_re_entry(re1, idx1);
-		entry2 = get_re_entry(re2, idx2);
-		if ((entry1 & ~(1ul << 63)) != (entry2 & ~(1ul << 63)))
-			return 0;
-		idx1 = next_re_idx(re1, entry1);
-		idx2 = next_re_idx(re2, entry2);
-	}
-	if (idx1 >= 0 || idx2 >= 0)
-		return 0;
-	return 1;
+	return re1->content == re2->content;
 }
 
 static int
 rip_less_than(const struct rip_entry *re1, const struct rip_entry *re2)
 {
-	int idx1, idx2;
-	unsigned long entry1, entry2;
-
-        idx1 = re1->nr_entries - 1;
-        idx2 = re2->nr_entries - 1;
-        while (idx1 >= 0 && idx2 >= 0) {
-		entry1 = get_re_entry(re1, idx1);
-		entry2 = get_re_entry(re2, idx2);
-		if (entry1 < entry2)
-                        return 1;
-		if (entry1 > entry2)
-                        return 0;
-		idx1 = next_re_idx(re1, entry1);
-		idx2 = next_re_idx(re2, entry2);
-        }
-        if (idx2 >= 0)
-                return 1;
-	return 0;
+	return re1->content < re2->content;
 }
 
 static void
 copy_rip_entry(struct rip_entry *dest, const struct rip_entry *src)
 {
-#if USE_OOL_RIPS
-	int nr_inline;
-
-	dest->nr_entries = src->nr_entries;
-	if (dest->nr_entries < NR_INLINE_RIPS) {
-		dest->nr_entries_allocated = 0;
-		nr_inline = dest->nr_entries;
-	} else {
-		dest->nr_entries_allocated = dest->nr_entries - NR_INLINE_RIPS;
-		nr_inline = NR_INLINE_RIPS;
-	}
-	VG_(memcpy)(dest->content, src->content, sizeof(dest->content[0]) * nr_inline);
-	if (dest->nr_entries_allocated != 0) {
-		dest->out_of_line_content = VG_(malloc)("rip_entry_content",
-							sizeof(dest->content[0]) * dest->nr_entries_allocated);
-		VG_(memcpy)(dest->out_of_line_content, src->out_of_line_content,
-			    sizeof(dest->out_of_line_content[0]) * dest->nr_entries_allocated);
-	} else {
-		/* For sanity */
-		dest->out_of_line_content = NULL;
-	}
-#else
 	*dest = *src;
-#endif
 }
 
 static void
@@ -495,13 +369,7 @@ _pop_call_stack(unsigned long rip)
 static void
 write_rip_entry(struct write_file *output, const struct rip_entry *re)
 {
-	int x;
-
-	write_file(output, &re->nr_entries, sizeof(re->nr_entries));
-	for (x = 0; x < re->nr_entries; x++) {
-		unsigned long e = get_re_entry(re, x);
-		write_file(output, &e, sizeof(e));
-	}
+	write_file(output, re, sizeof(*re));
 }
 
 static void
@@ -556,15 +424,6 @@ maintain_call_stack(IRSB *bb)
 	}
 }
 
-static void
-free_rip_entry(const struct rip_entry *re)
-{
-#if USE_OOL_RIPS
-	if (re->nr_entries_allocated > 0)
-		VG_(free)((void *)re->out_of_line_content);
-#endif
-}
-
 static int i_am_multithreaded;
 
 struct rip_set {
@@ -588,22 +447,6 @@ struct addr_hash_entry {
 #define NR_ADDR_HASH_HEADS 100271
 static struct addr_hash_entry *
 addr_hash_heads[NR_ADDR_HASH_HEADS];
-
-static void
-dump_rip_set(const struct rip_set *rs)
-{
-	int i;
-	VG_(printf)("Rip set: {");
-	for (i = 0; i < rs->nr_entries; i++) {
-		if (i != 0)
-			VG_(printf)("; ");
-		if (i == 0)
-			dump_rip_entry(&rs->entry0);
-		else
-			dump_rip_entry(&rs->entry1N[i-1]);
-	}
-	VG_(printf)("}\n");
-}
 
 static void
 sanity_check_set(const struct rip_set *as)
@@ -763,36 +606,20 @@ add_address_to_set(struct rip_set *set, const struct rip_entry *entry)
 	sanity_check_set(set);
 }
 
-#if !USE_OOL_RIPS
 static void
-init_rip_entry(struct rip_entry *here, const struct extending_stack *stack, unsigned long rip)
+init_rip_entry(struct rip_entry *here, unsigned long rip, int private)
 {
-	int x;
-	for (x = 0; x < MAX_CONTEXT - 1 && x < stack->nr_entries; x++)
-		here->content[x] = get_es_entry(stack, x);
-	here->content[x] = rip;
-	here->nr_entries = x + 1;
+	here->content = rip;
+	here->is_private = private;
 }
-#endif
 
 static void
 add_current_address_to_set(struct rip_set *set, unsigned long _addr, int private)
 {
-#if USE_OOL_RIPS
-	struct extending_stack *currentStack = &thread_callstacks[VG_(get_running_tid)()];
-	unsigned long addr = !private ? _addr : _addr | (1ul << 63);
-	tl_assert(_addr != 0);
-	push_call_stack(currentStack, addr);
-	add_address_to_set(set, currentStack);
-	pop_call_stack(currentStack, addr);
-#else
-	struct extending_stack *currentStack = &thread_callstacks[VG_(get_running_tid)()];
 	struct rip_entry here;
-	unsigned long addr = !private ? _addr : _addr | (1ul << 63);
 	tl_assert(_addr != 0);
-	init_rip_entry(&here, currentStack, addr);
+	init_rip_entry(&here, _addr, private);
 	add_address_to_set(set, &here);
-#endif
 }
 
 static unsigned
@@ -1101,11 +928,7 @@ get_set_entry(const struct rip_set *se, int idx)
 static void
 clear_private_flag(struct rip_entry *re)
 {
-#if USE_OOL_RIPS
-#error write me
-#else
-	re->content[re->nr_entries-1] &= ~(1ul << 63);
-#endif
+	re->is_private = 0;
 }
 
 static struct alias_table_entry *
@@ -1154,10 +977,6 @@ fold_set_to_alias_table(struct rip_set_pair *s)
 		merge_rip_sets(&ate->aliases_with.loads, &s->loads);
 		merge_rip_sets(&ate->aliases_with.stores, &s->stores);
 	}
-	for (i = 0; i < s->loads.nr_entries; i++)
-		free_rip_entry(get_set_entry(&s->loads, i));
-	for (i = 0; i < s->stores.nr_entries; i++)
-		free_rip_entry(get_set_entry(&s->stores, i));
 	if (s->loads.nr_entries_allocated > 1)
 		VG_(free)(s->loads.entry1N);
 	if (s->stores.nr_entries_allocated > 1)
