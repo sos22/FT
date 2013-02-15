@@ -140,12 +140,16 @@ bcg_fini(Int exitcode)
 	Char buf[128];
 	int x;
 	struct hash_entry *he;
+	unsigned long magic;
 
 	x = 0;
 	do {
 		x++;
 		VG_(sprintf)(buf, "callgraph%d.dat", x);
 	} while (open_write_file(&output, buf) != 0);
+
+	magic = 0xaabbccddeeff;
+	write_file(&output, &magic, sizeof(magic));
 
 	for (x = 0; x < NR_HASH_HEADS; x++) {
 		for (he = hash_heads[x]; he; he = he->next) {
