@@ -783,9 +783,7 @@ ft2_instrument(VgCallbackClosure* closure,
 	       IRType gWordTy,
 	       IRType hWordTy)
 {
-	IRSB *b;
-	b = log_loads(log_stores(bb));
-	return b;
+	return log_loads(log_stores(bb));
 }
 
 struct alias_table_entry {
@@ -1208,35 +1206,58 @@ make_memory_location_public(unsigned long addr)
 	}
 }
 
+struct alloc_hdr {
+	unsigned long real_size;
+	void *real_start;
+};
+
 static void
 ft2_free(ThreadId tid, void *p)
 {
-	if (p) {
-		unsigned long start = (unsigned long)p - 8;
-		unsigned long sz = *(unsigned long *)start;
-		release_memory_range(start, start + sz);
-		VG_(cli_free)((void *)start);
+	struct alloc_hdr *hdr;
+	if (!p) {
+		return;
 	}
+	hdr = p;
+	hdr--;
+	release_memory_range((unsigned long)hdr->real_start,
+			     (unsigned long)hdr->real_start + hdr->real_size);
+	VG_(cli_free)(hdr->real_start);
 }
 
 static void *
 ft2_memalign(ThreadId tid, SizeT align, SizeT n)
 {
-	void *res;
-	if (align < 8)
-		align = 8;
-	n += 8;
-	n = (n + 7ul) & ~7ul;
+	unsigned long raw_block;
+	unsigned long aligned_block;
+	struct alloc_hdr *hdr;
 
-	res = VG_(cli_malloc)(align, n);
-	if (res) {
-		refresh_tags(res, n);
-		*(unsigned long *)res = n;
-		set_memory_private((unsigned long)res, (unsigned long)res + n);
-		return (void *)((unsigned long)res + 8);
-	} else {
+	if (align < sizeof(struct alloc_hdr)) {
+		align = sizeof(struct alloc_hdr);
+	}
+	n += align + sizeof(struct alloc_hdr);
+
+	raw_block = (unsigned long)VG_(cli_malloc)(sizeof(struct alloc_hdr), n);
+	if (!raw_block) {
 		return NULL;
 	}
+	/* Reserve space for our header */
+	aligned_block = raw_block + sizeof(struct alloc_hdr);
+	/* And now skip to the right alignment */
+	/* (You could do this with masks if you knew align were a
+	   power of two, but we don't, so we can't.) */
+	if (aligned_block % align) {
+		aligned_block = aligned_block -
+			(aligned_block % align) +
+			align;
+	}
+	hdr = (struct alloc_hdr *)aligned_block - 1;
+	hdr->real_size = n;
+	hdr->real_start = raw_block;
+
+	refresh_tags((void *)hdr->real_start, hdr->real_size);
+	set_memory_private(raw_block, raw_block + hdr->real_size);
+	return aligned_block;
 }
 
 static void *
@@ -1261,6 +1282,7 @@ ft2_realloc(ThreadId tid, void *p, SizeT new_size)
 {
 	void *n;
 	unsigned long old_size;
+	struct alloc_hdr *hdr;
 
 	if (new_size == 0) {
 		ft2_free(tid, p);
@@ -1269,7 +1291,10 @@ ft2_realloc(ThreadId tid, void *p, SizeT new_size)
 	if (p == NULL)
 		return ft2_malloc(tid, new_size);
 	n = ft2_malloc(tid, new_size);
-	old_size = ((unsigned long *)p)[-1];
+	hdr = p;
+	old_size = (unsigned long)hdr->real_start +
+		hdr->real_size -
+		(unsigned long)p;
 	if (old_size < new_size)
 		VG_(memcpy)(n, p, old_size);
 	else
