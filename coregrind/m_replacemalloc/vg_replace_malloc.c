@@ -411,6 +411,16 @@ CALLOC(m_libc_soname, calloc_common);
       \
       if (!init_done) init(); \
       MALLOC_TRACE("realloc(%p,%llu)", ptrV, (ULong)new_size ); \
+      \
+      if (ptrV == NULL) \
+         /* We need to call a malloc-like function; so let's use \
+            one which we know exists. */ \
+         return VG_REPLACE_FUNCTION_ZU(m_libc_soname,malloc) (new_size); \
+      if (new_size <= 0) { \
+         VG_REPLACE_FUNCTION_ZU(m_libc_soname,free)(ptrV); \
+         MALLOC_TRACE(" = 0"); \
+         return NULL; \
+      } \
       v = (void*)VALGRIND_NON_SIMD_CALL2( info.tl_realloc, ptrV, new_size ); \
       MALLOC_TRACE(" = %p", v ); \
       return v; \
