@@ -31,8 +31,52 @@ struct write_file {
 	unsigned char buf[1024];
 };
 
-static struct write_file output_file;
-static int stack_is_private = 1;
+struct rip_entry {
+	unsigned long content:63;
+	unsigned long is_private:1;
+};
+
+struct rip_set {
+	int nr_entries;
+	int nr_entries_allocated; /* including entry0. */
+	struct rip_entry entry0;
+	struct rip_entry *entry1N;
+};
+
+struct rip_set_pair {
+	struct rip_set stores;
+	struct rip_set loads;
+};
+
+struct alias_table_entry {
+	struct alias_table_entry *next;
+	unsigned long hash;
+	struct rip_entry rip;
+	struct rip_set_pair aliases_with;
+};
+
+struct addr_hash_entry {
+	struct addr_hash_entry *next;
+	unsigned long addr;
+	struct rip_set_pair content;
+};
+
+#define NR_AT_HEADS 32768
+struct alias_table {
+	struct alias_table_entry *heads[NR_AT_HEADS];
+};
+
+static struct alias_table
+global_alias_table;
+static struct write_file
+output_file;
+static int
+stack_is_private = 1;
+static int
+i_am_multithreaded;
+#define NR_ADDR_HASH_HEADS 100271
+static struct addr_hash_entry *
+addr_hash_heads[NR_ADDR_HASH_HEADS];
 
 static void do_store(unsigned long addr, unsigned long data, unsigned long size,
 		     unsigned long rip);
@@ -267,11 +311,6 @@ close_write_file(struct write_file *wf)
 	VG_(close)(wf->fd);
 }
 
-struct rip_entry {
-	unsigned long content:63;
-	unsigned long is_private:1;
-};
-
 static unsigned
 hash_rip(const struct rip_entry *re)
 {
@@ -307,30 +346,6 @@ write_rip_entry(struct write_file *output, const struct rip_entry *re)
 {
 	write_file(output, re, sizeof(*re));
 }
-
-static int i_am_multithreaded;
-
-struct rip_set {
-	int nr_entries;
-	int nr_entries_allocated; /* including entry0. */
-	struct rip_entry entry0;
-	struct rip_entry *entry1N;
-};
-
-struct rip_set_pair {
-	struct rip_set stores;
-	struct rip_set loads;
-};
-
-struct addr_hash_entry {
-	struct addr_hash_entry *next;
-	unsigned long addr;
-	struct rip_set_pair content;
-};
-
-#define NR_ADDR_HASH_HEADS 100271
-static struct addr_hash_entry *
-addr_hash_heads[NR_ADDR_HASH_HEADS];
 
 static void
 sanity_check_set(const struct rip_set *as)
@@ -786,17 +801,6 @@ ft2_instrument(VgCallbackClosure* closure,
 	return log_loads(log_stores(bb));
 }
 
-struct alias_table_entry {
-	struct alias_table_entry *next;
-	unsigned long hash;
-	struct rip_entry rip;
-	struct rip_set_pair aliases_with;
-};
-
-#define NR_AT_HEADS 32768
-static struct alias_table_entry *
-at_heads[NR_AT_HEADS];
-
 static const struct rip_entry *
 get_set_entry(const struct rip_set *se, int idx)
 {
@@ -813,22 +817,22 @@ clear_private_flag(struct rip_entry *re)
 }
 
 static struct alias_table_entry *
-find_alias_table_entry(const struct rip_entry *re)
+find_alias_table_entry(struct alias_table *at, const struct rip_entry *re)
 {
 	unsigned long hash = hash_rip(re);
 	unsigned head = hash % NR_AT_HEADS;
 	struct alias_table_entry *cursor;
-	for (cursor = at_heads[head]; cursor; cursor = cursor->next) {
+	for (cursor = at->heads[head]; cursor; cursor = cursor->next) {
 		if (hash == cursor->hash && rips_equal_modulo_privateness(&cursor->rip, re))
 			return cursor;
 	}
 	cursor = VG_(malloc)("alias_table_entry", sizeof(*cursor));
-	cursor->next = at_heads[head];
+	cursor->next = at->heads[head];
 	cursor->hash = hash;
 	copy_rip_entry(&cursor->rip, re);
 	clear_private_flag(&cursor->rip);
 	VG_(memset)(&cursor->aliases_with, 0, sizeof(cursor->aliases_with));
-	at_heads[head] = cursor;
+	at->heads[head] = cursor;
 	return cursor;
 }
 
@@ -844,17 +848,17 @@ merge_rip_sets(struct rip_set *out, const struct rip_set *inp)
 /* Add the set @s to the global aliasing table.  Zap it to an empty
    set at the same time. */
 static void
-fold_set_to_alias_table(struct rip_set_pair *s)
+fold_set_to_alias_table(struct alias_table *at, struct rip_set_pair *s)
 {
 	int i;
 	struct alias_table_entry *ate;
 	for (i = 0; i < s->loads.nr_entries; i++) {
-		ate = find_alias_table_entry(get_set_entry(&s->loads, i));
+		ate = find_alias_table_entry(at, get_set_entry(&s->loads, i));
 		merge_rip_sets(&ate->aliases_with.loads, &s->loads);
 		merge_rip_sets(&ate->aliases_with.stores, &s->stores);
 	}
 	for (i = 0; i < s->stores.nr_entries; i++) {
-		ate = find_alias_table_entry(get_set_entry(&s->stores, i));
+		ate = find_alias_table_entry(at, get_set_entry(&s->stores, i));
 		merge_rip_sets(&ate->aliases_with.loads, &s->loads);
 		merge_rip_sets(&ate->aliases_with.stores, &s->stores);
 	}
@@ -877,21 +881,24 @@ ft2_fini(Int exitcode)
 	struct addr_hash_entry *ahe;
 	struct alias_table_entry *ate;
 	unsigned long magic;
+	struct alias_table *at = &global_alias_table;
 
 	VG_(printf)("ft2_fini() starts\n");
 	sanity_check_addr_hash();
 	VG_(printf)("Done sanity check\b");
 
-	for (x = 0; x < NR_ADDR_HASH_HEADS; x++)
-		for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next)
-			fold_set_to_alias_table(&ahe->content);
+	for (x = 0; x < NR_ADDR_HASH_HEADS; x++) {
+		for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next) {
+			fold_set_to_alias_table(at, &ahe->content);
+		}
+	}
 
 	VG_(printf)("Done folding\n");
 
 	magic = 0x1122334455;
 	write_file(&output_file, &magic, sizeof(magic));
 	for (x = 0; x < NR_AT_HEADS; x++) {
-		for (ate = at_heads[x]; ate; ate = ate->next) {
+		for (ate = at->heads[x]; ate; ate = ate->next) {
 			if (ate->aliases_with.stores.nr_entries > 0 ||
 			    ate->aliases_with.loads.nr_entries > 0) {
 				struct hdr hdr;
@@ -915,7 +922,7 @@ ft2_fini(Int exitcode)
 }
 
 static void
-refresh_tags(void *base, unsigned long size)
+refresh_tags(struct alias_table *at, void *base, unsigned long size)
 {
 	unsigned long start = (unsigned long)base & ~7ul;
 	unsigned long end = ((unsigned long)base + size + 7) & ~7ul;
@@ -926,15 +933,17 @@ refresh_tags(void *base, unsigned long size)
 	if (size >= NR_ADDR_HASH_HEADS * 16) {
 		for (x = 0; x < NR_ADDR_HASH_HEADS; x++) {
 			for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next) {
-				if (ahe->addr >= start && ahe->addr < end)
-					fold_set_to_alias_table(&ahe->content);
+				if (ahe->addr >= start && ahe->addr < end) {
+					fold_set_to_alias_table(at, &ahe->content);
+				}
 			}
 		}
 	} else {
 		for (ptr = start; ptr < end; ptr += 8) {
 			ahe = find_addr_hash_entry(ptr);
-			if (ahe)
-				fold_set_to_alias_table(&ahe->content);
+			if (ahe) {
+				fold_set_to_alias_table(at, &ahe->content);
+			}
 		}
 	}
 }
@@ -1215,7 +1224,8 @@ ft2_client_request(ThreadId tid, UWord *arg_block, UWord *ret)
 	*ret = 0;
 	if (VG_IS_TOOL_USERREQ('F', 'T', arg_block[0]) &&
 	    arg_block[0] == VG_USERREQ_TOOL_BASE('F', 'T')) {
-		refresh_tags((void *)arg_block[1],
+		refresh_tags(&global_alias_table,
+			     (void *)arg_block[1],
 			     arg_block[2]);
 		return True;
 	} else {
@@ -1263,10 +1273,6 @@ ft2_process_command_line_option(Char *opt)
 	return True;
 }
 
-
-
-//VG_DETERMINE_INTERFACE_VERSION(ft2_pre_clo_init)
-
 #include "pub_tool_hashtable.h"
 
 //------------------------------------------------------------//
@@ -1290,7 +1296,7 @@ typedef
 static VgHashTable malloc_list  = NULL;   // HP_Chunks
 
 static void *
-new_block(SizeT req_szB, SizeT req_alignB )
+new_block(struct alias_table *at, SizeT req_szB, SizeT req_alignB )
 {
    HP_Chunk* hc;
    void *p;
@@ -1308,7 +1314,7 @@ new_block(SizeT req_szB, SizeT req_alignB )
    hc->data     = (Addr)p;
    VG_(HT_add_node)(malloc_list, hc);
 
-   refresh_tags(p, req_szB);
+   refresh_tags(at, p, req_szB);
    set_memory_private((unsigned long)p, (unsigned long)p + req_szB);
 
    return p;
@@ -1317,7 +1323,7 @@ new_block(SizeT req_szB, SizeT req_alignB )
 static void *
 ms_memalign ( ThreadId tid, SizeT alignB, SizeT szB )
 {
-	return new_block(szB, alignB);
+	return new_block(&global_alias_table, szB, alignB);
 }
 
 static void *
@@ -1371,7 +1377,7 @@ static void* ms_realloc ( ThreadId tid, void* p_old, SizeT new_szB )
 
 	VG_(HT_add_node)(malloc_list, hc);
 
-	refresh_tags(p_new, new_szB);
+	refresh_tags(&global_alias_table, p_new, new_szB);
 	set_memory_private((unsigned long)p_new, (unsigned long)p_new + new_szB);
 
 	return p_new;
