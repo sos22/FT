@@ -20,7 +20,6 @@
 
 #define PAGE_SIZE (4096ul)
 
-#define CHECK_SANITY 0
 #define NOISY 0
 
 struct write_file {
@@ -28,6 +27,12 @@ struct write_file {
 	unsigned long offset;
 	unsigned long written;
 	unsigned buf_prod;
+	unsigned char buf[1024];
+};
+struct read_file {
+	int fd;
+	unsigned buf_prod;
+	unsigned buf_cons;
 	unsigned char buf[1024];
 };
 
@@ -50,7 +55,6 @@ struct rip_set_pair {
 
 struct alias_table_entry {
 	struct alias_table_entry *next;
-	unsigned long hash;
 	struct rip_entry rip;
 	struct rip_set_pair aliases_with;
 };
@@ -61,15 +65,13 @@ struct addr_hash_entry {
 	struct rip_set_pair content;
 };
 
-#define NR_AT_HEADS 32768
+#define NR_AT_HEADS 32769
 struct alias_table {
 	struct alias_table_entry *heads[NR_AT_HEADS];
 };
 
 static struct alias_table
 global_alias_table;
-static struct write_file
-output_file;
 static int
 stack_is_private = 1;
 static int
@@ -77,6 +79,8 @@ i_am_multithreaded;
 #define NR_ADDR_HASH_HEADS 100271
 static struct addr_hash_entry *
 addr_hash_heads[NR_ADDR_HASH_HEADS];
+static Char *
+output_fname;
 
 static void do_store(unsigned long addr, unsigned long data, unsigned long size,
 		     unsigned long rip);
@@ -261,7 +265,7 @@ open_write_file(struct write_file *out, const Char *fname)
 {
 	SysRes sr;
 
-	sr = VG_(open)(fname, VKI_O_WRONLY|VKI_O_CREAT|VKI_O_EXCL, 0600);
+	sr = VG_(open)(fname, VKI_O_WRONLY|VKI_O_CREAT|VKI_O_TRUNC, 0600);
 	if (sr.isError)
 		return sr.err;
 	out->fd = sr.res;
@@ -311,6 +315,66 @@ close_write_file(struct write_file *wf)
 	VG_(close)(wf->fd);
 }
 
+static int
+open_read_file(struct read_file *out, const Char *fname)
+{
+	SysRes sr;
+
+	sr = VG_(open)(fname, VKI_O_RDONLY, 0600);
+	if (sr.isError) {
+		return sr.err;
+	}
+	out->fd = sr.res;
+	out->buf_prod = 0;
+	out->buf_cons = 0;
+	return 0;
+}
+
+static int
+read_file(struct read_file *rf, void *buf, size_t sz)
+{
+	unsigned to_copy;
+	unsigned rd;
+	unsigned offst;
+
+	offst = 0;
+	while (offst < sz) {
+		to_copy = rf->buf_prod - rf->buf_cons;
+		if (to_copy + offst > sz) {
+			to_copy = sz - offst;
+		}
+		if (to_copy == 0) {
+			VG_(memmove)(rf->buf, rf->buf + rf->buf_cons, rf->buf_prod - rf->buf_cons);
+			rf->buf_prod -= rf->buf_cons;
+			rf->buf_cons = 0;
+			rd = VG_(read)(rf->fd, (void *)((unsigned long)rf->buf + rf->buf_prod), sizeof(rf->buf) - rf->buf_prod);
+			if (rd == 0) {
+				/* Hit EOF */
+				return -1;
+			}
+			if (rd < 0) {
+				/* Error reading file */
+				VG_(printf)("Error %d reading file\n", rd);
+				VG_(tool_panic)((Char *)"can't read file");
+			}
+			rf->buf_prod += rd;
+		}
+		VG_(memcpy)((void *)((unsigned long)buf + offst),
+			    (const void *)((unsigned long)rf->buf + rf->buf_cons),
+			    to_copy);
+		offst += to_copy;
+		rf->buf_cons += to_copy;
+	}
+	return 0;
+}
+
+static void
+close_read_file(struct read_file *rf)
+{
+	VG_(close)(rf->fd);
+}
+
+
 static unsigned
 hash_rip(const struct rip_entry *re)
 {
@@ -348,32 +412,11 @@ write_rip_entry(struct write_file *output, const struct rip_entry *re)
 }
 
 static void
-sanity_check_set(const struct rip_set *as)
+read_rip_entry(struct read_file *input, struct rip_entry *re)
 {
-#if CHECK_SANITY
-       int x;
-
-       tl_assert(as->nr_entries >= 0);
-       if (as->nr_entries == 0)
-	       return;
-       sanity_check_rip(&as->entry0);
-       if (as->nr_entries == 1)
-               return;
-       if (as->nr_entries == 2) {
-	       sanity_check_rip(&as->u.entry1);
-	       tl_assert(rip_less_than(&as->entry0, as->entry0.rip, &as->u.entry1, as->u.entry1.rip));
-               return;
-       }
-       tl_assert(as->nr_entries <= as->nr_entries_allocated);
-       tl_assert(rip_less_than(&as->entry0, as->entry0.rip, &as->u.entry1N[0], as->u.entry1N[0].rip));
-       sanity_check_rip(&as->u.entry1N[0]);
-       for (x = 0; x < as->nr_entries-2; x++) {
-	       sanity_check_rip(&as->u.entry1N[x]);
-	       sanity_check_rip(&as->u.entry1N[x+1]);
-               tl_assert(rip_less_than(&as->u.entry1N[x], as->u.entry1N[x].rip,
-				       &as->u.entry1N[x+1], as->u.entry1N[x+1].rip));
-       }
-#endif
+	if (read_file(input, re, sizeof(*re)) != 0) {
+		VG_(tool_panic)("Reading RIP entry");
+	}
 }
 
 static void
@@ -381,8 +424,6 @@ add_address_to_set(struct rip_set *set, const struct rip_entry *entry)
 {
 	int low, high;
 	struct rip_entry *ool;
-
-	sanity_check_set(set);
 
 	if (set->nr_entries == 0) {
 		copy_rip_entry(&set->entry0, entry);
@@ -502,7 +543,6 @@ add_address_to_set(struct rip_set *set, const struct rip_entry *entry)
 		}
 	}
 	set->nr_entries++;
-	sanity_check_set(set);
 }
 
 static void
@@ -557,26 +597,10 @@ find_addr_hash_entry(unsigned long addr)
 }
 
 static void
-sanity_check_addr_hash(void)
-{
-#if CHECK_SANITY
-	unsigned x;
-	struct addr_hash_entry *cursor;
-	for (x = 0; x < NR_ADDR_HASH_HEADS; x++)
-		for (cursor = addr_hash_heads[x]; cursor; cursor = cursor->next) {
-			sanity_check_set(&cursor->content.stores);
-			sanity_check_set(&cursor->content.loads);
-		}
-#endif
-}
-
-static void
 log_store(unsigned long rip, unsigned long addr, int private)
 {
 	struct addr_hash_entry *ahe = find_addr_hash_entry(addr);
 	add_current_address_to_set(&ahe->content.stores, rip, private);
-
-	sanity_check_addr_hash();
 }
 
 struct stack_data {
@@ -630,7 +654,6 @@ do_log_load(unsigned long addr, unsigned long rip)
 		return;
 	ahe = find_addr_hash_entry(addr);
 	add_current_address_to_set(&ahe->content.loads, rip, memory_location_is_private(addr) || !i_am_multithreaded);
-	sanity_check_addr_hash();
 }
 
 static void
@@ -786,8 +809,9 @@ log_loads(IRSB *inp)
 static void
 ft2_post_clo_init(void)
 {
-	if (!output_file.fd)
+	if (!output_fname) {
 		VG_(tool_panic)((Char *)"need to know where to put the output!\n");
+	}
 }
 
 static IRSB *
@@ -823,12 +847,11 @@ find_alias_table_entry(struct alias_table *at, const struct rip_entry *re)
 	unsigned head = hash % NR_AT_HEADS;
 	struct alias_table_entry *cursor;
 	for (cursor = at->heads[head]; cursor; cursor = cursor->next) {
-		if (hash == cursor->hash && rips_equal_modulo_privateness(&cursor->rip, re))
+		if (rips_equal_modulo_privateness(&cursor->rip, re))
 			return cursor;
 	}
 	cursor = VG_(malloc)("alias_table_entry", sizeof(*cursor));
 	cursor->next = at->heads[head];
-	cursor->hash = hash;
 	copy_rip_entry(&cursor->rip, re);
 	clear_private_flag(&cursor->rip);
 	VG_(memset)(&cursor->aliases_with, 0, sizeof(cursor->aliases_with));
@@ -874,26 +897,20 @@ struct hdr {
 };
 
 static void
-ft2_fini(Int exitcode)
+write_tag_dump(const Char *fname, const struct alias_table *at)
 {
-	int x;
-	int i;
-	struct addr_hash_entry *ahe;
+	static struct write_file output_file;
 	struct alias_table_entry *ate;
 	unsigned long magic;
-	struct alias_table *at = &global_alias_table;
+	int err;
+	int x;
+	int i;
 
-	VG_(printf)("ft2_fini() starts\n");
-	sanity_check_addr_hash();
-	VG_(printf)("Done sanity check\b");
-
-	for (x = 0; x < NR_ADDR_HASH_HEADS; x++) {
-		for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next) {
-			fold_set_to_alias_table(at, &ahe->content);
-		}
+	err = open_write_file(&output_file, fname);
+	if (err) {
+		VG_(printf)("Cannot open %s: %d\n", fname, err);
+		VG_(tool_panic)("Cannot open database");
 	}
-
-	VG_(printf)("Done folding\n");
 
 	magic = 0x1122334455;
 	write_file(&output_file, &magic, sizeof(magic));
@@ -906,16 +923,37 @@ ft2_fini(Int exitcode)
 				hdr.nr_stores = ate->aliases_with.stores.nr_entries;
 				write_file(&output_file, &hdr, sizeof(hdr));
 				write_rip_entry(&output_file, &ate->rip);
-				for (i = 0; i < ate->aliases_with.loads.nr_entries; i++)
+				for (i = 0; i < ate->aliases_with.loads.nr_entries; i++) {
 					write_rip_entry(&output_file,
 							get_set_entry(&ate->aliases_with.loads, i));
-				for (i = 0; i < ate->aliases_with.stores.nr_entries; i++)
+				}
+				for (i = 0; i < ate->aliases_with.stores.nr_entries; i++) {
 					write_rip_entry(&output_file,
 							get_set_entry(&ate->aliases_with.stores, i));
+				}
 			}
 		}
 	}
 	close_write_file(&output_file);
+}
+
+static void
+ft2_fini(Int exitcode)
+{
+	int x;
+	struct addr_hash_entry *ahe;
+
+	VG_(printf)("ft2_fini() starts\n");
+
+	for (x = 0; x < NR_ADDR_HASH_HEADS; x++) {
+		for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next) {
+			fold_set_to_alias_table(&global_alias_table, &ahe->content);
+		}
+	}
+
+	VG_(printf)("Done folding\n");
+
+	write_tag_dump(output_fname, &global_alias_table);
 
 	VG_(printf)("Finished writing results\n");
 
@@ -958,30 +996,6 @@ struct memory_tree_entry {
 
 static struct memory_tree_entry *memory_root;
 
-#if CHECK_SANITY
-static void
-_sanity_check_memory_tree(unsigned long start, unsigned long end, const struct memory_tree_entry *mte)
-{
-	if (!mte)
-		return;
-	tl_assert(start <= mte->start);
-	tl_assert(end >= mte->end);
-	tl_assert(mte->start < mte->end);
-	tl_assert(mte->private == 0 || mte->private == 1);
-	if (mte->prev)
-		_sanity_check_memory_tree(start, mte->start, mte->prev);
-	if (mte->next)
-		_sanity_check_memory_tree(mte->end, end, mte->next);
-}
-#endif
-static void
-sanity_check_memory_tree(void)
-{
-#if CHECK_SANITY
-	_sanity_check_memory_tree(0, ~0ul, memory_root);
-#endif
-}
-
 static struct memory_tree_entry *
 new_memory_tree_entry(unsigned long start, unsigned long end)
 {
@@ -1006,8 +1020,6 @@ set_memory_private(unsigned long start, unsigned long end)
 	struct memory_tree_entry *mte;
 	struct memory_tree_entry **mtep;
 
-	sanity_check_memory_tree();
-
 	if (NOISY) {
 		VG_(printf)("%d: set_memory_private(%lx, %lx)\n",
 			    VG_(get_running_tid)(), start, end);
@@ -1030,7 +1042,6 @@ set_memory_private(unsigned long start, unsigned long end)
 	}
 	*mtep = new_memory_tree_entry(start, end);
 	(*mtep)->tid = VG_(get_running_tid)();
-	sanity_check_memory_tree();
 	return;
 }
 
@@ -1041,7 +1052,6 @@ release_memory_range(unsigned long start, unsigned long end)
 	struct memory_tree_entry *cursor;
 	struct memory_tree_entry **mtep;
 
-	sanity_check_memory_tree();
 	mtep = &memory_root;
 	while (1) {
 		mte = *mtep;
@@ -1104,7 +1114,6 @@ release_memory_range(unsigned long start, unsigned long end)
 			    start, end, mte->start, mte->end);
 		tl_assert(0);
 	}
-	sanity_check_memory_tree();
 }
 
 static int
@@ -1245,6 +1254,8 @@ static void
 ft2_print_usage(void)
 {
 	VG_(printf)("\t--output=<fname>     Where to dump the type file\n");
+	VG_(printf)("\t--input=<fname>      Tag table to pre-init the global table with\n");
+	VG_(printf)("\t--stack-private=yes|no Is the stack thread-private?  Default yes\n");
 }
 
 static void
@@ -1252,19 +1263,61 @@ ft2_print_debug_usage(void)
 {
 }
 
+static int
+read_alias_table_entry(struct read_file *rfile, struct alias_table *at)
+{
+	struct hdr hdr;
+	struct rip_entry re;
+	struct alias_table_entry *ate;
+	int i;
+
+	if (read_file(rfile, &hdr, sizeof(hdr)) < 0) {
+		return 0;
+	}
+	read_rip_entry(rfile, &re);
+	ate = find_alias_table_entry(at, &re);
+	for (i = 0; i < hdr.nr_loads; i++) {
+		read_rip_entry(rfile, &re);
+		add_address_to_set(&ate->aliases_with.loads, &re);
+	}
+	for (i = 0; i < hdr.nr_stores; i++) {
+		read_rip_entry(rfile, &re);
+		add_address_to_set(&ate->aliases_with.stores, &re);
+	}
+	return 1;
+}
+
+static void
+read_tag_dump(const Char *fname)
+{
+	static struct read_file rfile;
+	int err;
+	unsigned long magic;
+
+	err = open_read_file(&rfile, fname);
+	if (err) {
+		VG_(printf)("%d opening %s\n", err, fname);
+		VG_(tool_panic)("Cannot read input file");
+	}
+	if (read_file(&rfile, &magic, sizeof(magic)) != 0 ||
+	    magic != 0x1122334455) {
+		VG_(printf)("Wrong file format; magic %lx\n", magic);
+		VG_(tool_panic)("Bad input");
+	}
+	while (read_alias_table_entry(&rfile, &global_alias_table)) {
+		/* noop */
+	}
+	close_read_file(&rfile);
+}
+
 static Bool
 ft2_process_command_line_option(Char *opt)
 {
-	Char *pathname;
-	int err;
-
 	if (VG_CLO_STREQN(VG_(strlen)("--output")+1, opt, "--output=")) {
-		pathname = opt + VG_(strlen)("--output") + 1;
-		err = open_write_file(&output_file, pathname);
-		if (err) {
-			VG_(printf)("Cannot open %s: %d\n", pathname, err);
-			VG_(tool_panic)("Cannot open database");
-		}
+		output_fname = opt + VG_(strlen)("--output") + 1;
+		return True;
+	} else if (VG_CLO_STREQN(VG_(strlen)("--input")+1, opt, "--input=")) {
+		read_tag_dump(opt + VG_(strlen)("--input") + 1);
 		return True;
 	} else VG_BOOL_CLO(opt, "--stack-private", stack_is_private)
 	else {
