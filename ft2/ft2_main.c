@@ -314,7 +314,7 @@ close_write_file(struct write_file *wf)
 static unsigned
 hash_rip(const struct rip_entry *re)
 {
-	return (re->content >> 33) ^ (re->content) ^ re->is_private;
+	return (re->content >> 33) ^ (re->content);
 }
 
 static int
