@@ -838,7 +838,7 @@ fold_set_to_alias_table(struct alias_table *at, struct rip_set_pair *s, int pres
 static void
 copy_rip_set(struct rip_set *dest, const struct rip_set *src)
 {
-	dest->nr_entries = src->nr_entries_allocated;
+	dest->nr_entries = src->nr_entries;
 	dest->nr_entries_allocated = src->nr_entries_allocated;
 	if (src->nr_entries_allocated > 1) {
 		dest->entry1N = VG_(malloc)(
