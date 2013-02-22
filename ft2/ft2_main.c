@@ -762,10 +762,220 @@ log_change_rsp(IRSB *irsb, IRExpr *new_value)
 }
 
 static void
+clear_private_flag(struct rip_entry *re)
+{
+	re->is_private = 0;
+}
+
+static struct alias_table_entry *
+find_alias_table_entry(struct alias_table *at, const struct rip_entry *re)
+{
+	unsigned long hash = hash_rip(re);
+	unsigned head = hash % NR_AT_HEADS;
+	struct alias_table_entry *cursor;
+	for (cursor = at->heads[head]; cursor; cursor = cursor->next) {
+		if (rips_equal_modulo_privateness(&cursor->rip, re))
+			return cursor;
+	}
+	cursor = VG_(malloc)("alias_table_entry", sizeof(*cursor));
+	cursor->next = at->heads[head];
+	copy_rip_entry(&cursor->rip, re);
+	clear_private_flag(&cursor->rip);
+	VG_(memset)(&cursor->aliases_with, 0, sizeof(cursor->aliases_with));
+	at->heads[head] = cursor;
+	return cursor;
+}
+
+static const struct rip_entry *
+get_set_entry(const struct rip_set *se, int idx)
+{
+	if (idx == 0)
+		return &se->entry0;
+	else
+		return &se->entry1N[idx - 1];
+}
+
+static void
+merge_rip_sets(struct rip_set *out, const struct rip_set *inp)
+{
+	int i;
+	for (i = 0; i < inp->nr_entries; i++)
+		add_address_to_set(out, get_set_entry(inp, i));
+}
+
+/* Add the set @s to the global aliasing table.  Zap it to an empty
+   set at the same time. */
+static void
+fold_set_to_alias_table(struct alias_table *at, struct rip_set_pair *s, int preserve)
+{
+	int i;
+	struct alias_table_entry *ate;
+	for (i = 0; i < s->loads.nr_entries; i++) {
+		ate = find_alias_table_entry(at, get_set_entry(&s->loads, i));
+		merge_rip_sets(&ate->aliases_with.loads, &s->loads);
+		merge_rip_sets(&ate->aliases_with.stores, &s->stores);
+	}
+	for (i = 0; i < s->stores.nr_entries; i++) {
+		ate = find_alias_table_entry(at, get_set_entry(&s->stores, i));
+		merge_rip_sets(&ate->aliases_with.loads, &s->loads);
+		merge_rip_sets(&ate->aliases_with.stores, &s->stores);
+	}
+	if (!preserve) {
+		if (s->loads.nr_entries_allocated > 1) {
+			VG_(free)(s->loads.entry1N);
+		}
+		if (s->stores.nr_entries_allocated > 1) {
+			VG_(free)(s->stores.entry1N);
+		}
+		VG_(memset)(s, 0, sizeof(*s));
+	}
+}
+
+static void
+copy_rip_set(struct rip_set *dest, const struct rip_set *src)
+{
+	dest->nr_entries = src->nr_entries_allocated;
+	dest->nr_entries_allocated = src->nr_entries_allocated;
+	if (src->nr_entries_allocated > 1) {
+		dest->entry1N = VG_(malloc)(
+			"address set OOL",
+			sizeof(dest->entry1N[0]) * (dest->nr_entries_allocated-1));
+		VG_(memcpy)(dest->entry1N, src->entry1N, sizeof(dest->entry1N[0]) * (dest->nr_entries - 1));
+	}
+	dest->entry0 = src->entry0;
+}
+
+static void
+copy_rip_set_pair(struct rip_set_pair *dest, const struct rip_set_pair *src)
+{
+	copy_rip_set(&dest->stores, &src->stores);
+	copy_rip_set(&dest->loads, &src->loads);
+}
+
+static void
+dupe_alias_table(struct alias_table *dest, const struct alias_table *src)
+{
+	int x;
+	const struct alias_table_entry *ate;
+	struct alias_table_entry *n;
+	for (x = 0; x < NR_AT_HEADS; x++) {
+		tl_assert(dest->heads[x] == NULL);
+		for (ate = src->heads[x]; ate; ate = ate->next) {
+			n = VG_(malloc)("alias_table_entry", sizeof(*n));
+			n->next = dest->heads[x];
+			copy_rip_entry(&n->rip, &ate->rip);
+			copy_rip_set_pair(&n->aliases_with, &ate->aliases_with);
+			dest->heads[x] = n;
+		}
+	}
+}
+
+struct hdr {
+	int nr_loads;
+	int nr_stores;
+};
+
+static void
+write_tag_dump(const Char *fname, const struct alias_table *at)
+{
+	static struct write_file output_file;
+	struct alias_table_entry *ate;
+	unsigned long magic;
+	int err;
+	int x;
+	int i;
+
+	err = open_write_file(&output_file, fname);
+	if (err) {
+		VG_(printf)("Cannot open %s: %d\n", fname, err);
+		VG_(tool_panic)("Cannot open database");
+	}
+
+	magic = 0x1122334455;
+	write_file(&output_file, &magic, sizeof(magic));
+	for (x = 0; x < NR_AT_HEADS; x++) {
+		for (ate = at->heads[x]; ate; ate = ate->next) {
+			if (ate->aliases_with.stores.nr_entries > 0 ||
+			    ate->aliases_with.loads.nr_entries > 0) {
+				struct hdr hdr;
+				hdr.nr_loads = ate->aliases_with.loads.nr_entries;
+				hdr.nr_stores = ate->aliases_with.stores.nr_entries;
+				write_file(&output_file, &hdr, sizeof(hdr));
+				write_rip_entry(&output_file, &ate->rip);
+				for (i = 0; i < ate->aliases_with.loads.nr_entries; i++) {
+					write_rip_entry(&output_file,
+							get_set_entry(&ate->aliases_with.loads, i));
+				}
+				for (i = 0; i < ate->aliases_with.stores.nr_entries; i++) {
+					write_rip_entry(&output_file,
+							get_set_entry(&ate->aliases_with.stores, i));
+				}
+			}
+		}
+	}
+	close_write_file(&output_file);
+}
+
+static void
+cleanup_rip_set(struct rip_set *rs)
+{
+	if (rs->nr_entries_allocated > 1) {
+		VG_(free)(rs->entry1N);
+	}
+	VG_(memset)(rs, 0, sizeof(*rs));
+}
+
+static void
+cleanup_rip_set_pair(struct rip_set_pair *rsp)
+{
+	cleanup_rip_set(&rsp->stores);
+	cleanup_rip_set(&rsp->loads);
+}
+
+static void
+release_alias_table_entry(struct alias_table_entry *ate)
+{
+	cleanup_rip_set_pair(&ate->aliases_with);
+	VG_(free)(ate);
+}
+
+static void
+cleanup_alias_table(struct alias_table *at)
+{
+	int x;
+	struct alias_table_entry *ate, *next;
+	for (x = 0; x < NR_AT_HEADS; x++) {
+		for (ate = at->heads[x]; ate; ate = next) {
+			next = ate->next;
+			release_alias_table_entry(ate);
+		}
+		at->heads[x] = NULL;
+	}
+}
+
+static void
 periodic_cb(void)
 {
-	VG_(printf)("Periodic callback invoked, cntr %ld\n", bb_cntr);
+	static struct alias_table snapshot_table;
+	static int cntr;
+	Char fname[128];
+	int x;
+	struct addr_hash_entry *ahe;
+
 	bb_cntr = periodic_work_period;
+
+	VG_(sprintf)(fname, "snapshot%d", cntr);
+	cntr++;
+	VG_(printf)("Writing snapshot %s\n", fname);
+	dupe_alias_table(&snapshot_table, &global_alias_table);
+	for (x = 0; x < NR_ADDR_HASH_HEADS; x++) {
+		for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next) {
+			fold_set_to_alias_table(&global_alias_table, &ahe->content, 1);
+		}
+	}
+	write_tag_dump(fname, &snapshot_table);
+	cleanup_alias_table(&snapshot_table);
+	VG_(printf)("Wrote snapshot\n");
 }
 
 static IRSB *
@@ -898,118 +1108,6 @@ ft2_instrument(VgCallbackClosure* closure,
 	return log_loads(log_stores(bb));
 }
 
-static const struct rip_entry *
-get_set_entry(const struct rip_set *se, int idx)
-{
-	if (idx == 0)
-		return &se->entry0;
-	else
-		return &se->entry1N[idx - 1];
-}
-
-static void
-clear_private_flag(struct rip_entry *re)
-{
-	re->is_private = 0;
-}
-
-static struct alias_table_entry *
-find_alias_table_entry(struct alias_table *at, const struct rip_entry *re)
-{
-	unsigned long hash = hash_rip(re);
-	unsigned head = hash % NR_AT_HEADS;
-	struct alias_table_entry *cursor;
-	for (cursor = at->heads[head]; cursor; cursor = cursor->next) {
-		if (rips_equal_modulo_privateness(&cursor->rip, re))
-			return cursor;
-	}
-	cursor = VG_(malloc)("alias_table_entry", sizeof(*cursor));
-	cursor->next = at->heads[head];
-	copy_rip_entry(&cursor->rip, re);
-	clear_private_flag(&cursor->rip);
-	VG_(memset)(&cursor->aliases_with, 0, sizeof(cursor->aliases_with));
-	at->heads[head] = cursor;
-	return cursor;
-}
-
-static void
-merge_rip_sets(struct rip_set *out, const struct rip_set *inp)
-{
-	int i;
-	for (i = 0; i < inp->nr_entries; i++)
-		add_address_to_set(out, get_set_entry(inp, i));
-}
-
-
-/* Add the set @s to the global aliasing table.  Zap it to an empty
-   set at the same time. */
-static void
-fold_set_to_alias_table(struct alias_table *at, struct rip_set_pair *s)
-{
-	int i;
-	struct alias_table_entry *ate;
-	for (i = 0; i < s->loads.nr_entries; i++) {
-		ate = find_alias_table_entry(at, get_set_entry(&s->loads, i));
-		merge_rip_sets(&ate->aliases_with.loads, &s->loads);
-		merge_rip_sets(&ate->aliases_with.stores, &s->stores);
-	}
-	for (i = 0; i < s->stores.nr_entries; i++) {
-		ate = find_alias_table_entry(at, get_set_entry(&s->stores, i));
-		merge_rip_sets(&ate->aliases_with.loads, &s->loads);
-		merge_rip_sets(&ate->aliases_with.stores, &s->stores);
-	}
-	if (s->loads.nr_entries_allocated > 1)
-		VG_(free)(s->loads.entry1N);
-	if (s->stores.nr_entries_allocated > 1)
-		VG_(free)(s->stores.entry1N);
-	VG_(memset)(s, 0, sizeof(*s));
-}
-struct hdr {
-	int nr_loads;
-	int nr_stores;
-};
-
-static void
-write_tag_dump(const Char *fname, const struct alias_table *at)
-{
-	static struct write_file output_file;
-	struct alias_table_entry *ate;
-	unsigned long magic;
-	int err;
-	int x;
-	int i;
-
-	err = open_write_file(&output_file, fname);
-	if (err) {
-		VG_(printf)("Cannot open %s: %d\n", fname, err);
-		VG_(tool_panic)("Cannot open database");
-	}
-
-	magic = 0x1122334455;
-	write_file(&output_file, &magic, sizeof(magic));
-	for (x = 0; x < NR_AT_HEADS; x++) {
-		for (ate = at->heads[x]; ate; ate = ate->next) {
-			if (ate->aliases_with.stores.nr_entries > 0 ||
-			    ate->aliases_with.loads.nr_entries > 0) {
-				struct hdr hdr;
-				hdr.nr_loads = ate->aliases_with.loads.nr_entries;
-				hdr.nr_stores = ate->aliases_with.stores.nr_entries;
-				write_file(&output_file, &hdr, sizeof(hdr));
-				write_rip_entry(&output_file, &ate->rip);
-				for (i = 0; i < ate->aliases_with.loads.nr_entries; i++) {
-					write_rip_entry(&output_file,
-							get_set_entry(&ate->aliases_with.loads, i));
-				}
-				for (i = 0; i < ate->aliases_with.stores.nr_entries; i++) {
-					write_rip_entry(&output_file,
-							get_set_entry(&ate->aliases_with.stores, i));
-				}
-			}
-		}
-	}
-	close_write_file(&output_file);
-}
-
 static void
 ft2_fini(Int exitcode)
 {
@@ -1020,7 +1118,7 @@ ft2_fini(Int exitcode)
 
 	for (x = 0; x < NR_ADDR_HASH_HEADS; x++) {
 		for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next) {
-			fold_set_to_alias_table(&global_alias_table, &ahe->content);
+			fold_set_to_alias_table(&global_alias_table, &ahe->content, 0);
 		}
 	}
 
@@ -1045,7 +1143,7 @@ refresh_tags(struct alias_table *at, void *base, unsigned long size)
 		for (x = 0; x < NR_ADDR_HASH_HEADS; x++) {
 			for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next) {
 				if (ahe->addr >= start && ahe->addr < end) {
-					fold_set_to_alias_table(at, &ahe->content);
+					fold_set_to_alias_table(at, &ahe->content, 0);
 				}
 			}
 		}
@@ -1053,7 +1151,7 @@ refresh_tags(struct alias_table *at, void *base, unsigned long size)
 		for (ptr = start; ptr < end; ptr += 8) {
 			ahe = find_addr_hash_entry(ptr);
 			if (ahe) {
-				fold_set_to_alias_table(at, &ahe->content);
+				fold_set_to_alias_table(at, &ahe->content, 0);
 			}
 		}
 	}
