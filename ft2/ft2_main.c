@@ -573,7 +573,7 @@ static unsigned
 hash_address(unsigned long addr)
 {
 	addr /= 32;
-	while (addr > NR_ADDR_HASH_HEADS)
+	while (addr >= NR_ADDR_HASH_HEADS)
 		addr = (addr % NR_ADDR_HASH_HEADS) ^ (addr / NR_ADDR_HASH_HEADS);
 	return addr;
 }
