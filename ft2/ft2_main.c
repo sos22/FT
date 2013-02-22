@@ -81,6 +81,10 @@ static struct addr_hash_entry *
 addr_hash_heads[NR_ADDR_HASH_HEADS];
 static Char *
 output_fname;
+static unsigned long
+bb_cntr;
+static unsigned long
+periodic_work_period;
 
 static void do_store(unsigned long addr, unsigned long data, unsigned long size,
 		     unsigned long rip);
@@ -757,6 +761,13 @@ log_change_rsp(IRSB *irsb, IRExpr *new_value)
 		       NULL);
 }
 
+static void
+periodic_cb(void)
+{
+	VG_(printf)("Periodic callback invoked, cntr %ld\n", bb_cntr);
+	bb_cntr = periodic_work_period;
+}
+
 static IRSB *
 log_loads(IRSB *inp)
 {
@@ -764,6 +775,67 @@ log_loads(IRSB *inp)
 	int x;
 	IRStmt *stmt;
 	unsigned long instr_start;
+	IRTemp addr_tmp;
+	IRTemp cntr_tmp;
+	IRTemp cntr2_tmp;
+	IRTemp guard_tmp;
+	IRDirty *run_period;
+
+	if (periodic_work_period != 0) {
+		/* Arrange for the periodic callback to run every $N
+		 * basic blocks. */
+		addr_tmp = newIRTemp(out->tyenv, Ity_I64);
+		cntr_tmp = newIRTemp(out->tyenv, Ity_I64);
+		cntr2_tmp = newIRTemp(out->tyenv, Ity_I64);
+		guard_tmp = newIRTemp(out->tyenv, Ity_I1);
+		addStmtToIRSB(
+			out,
+			IRStmt_WrTmp(
+				addr_tmp,
+				IRExpr_Const(
+					IRConst_U64((unsigned long)&bb_cntr))));
+		addStmtToIRSB(
+			out,
+			IRStmt_WrTmp(
+				cntr_tmp,
+				IRExpr_Load(
+					Iend_LE,
+					Ity_I64,
+					IRExpr_RdTmp(addr_tmp))));
+		addStmtToIRSB(
+			out,
+			IRStmt_WrTmp(
+				cntr2_tmp,
+				IRExpr_Binop(
+					Iop_Sub64,
+					IRExpr_RdTmp(cntr_tmp),
+					IRExpr_Const(
+						IRConst_U64(1)))));
+		addStmtToIRSB(
+			out,
+			IRStmt_Store(
+				Iend_LE,
+				IRExpr_RdTmp(addr_tmp),
+				IRExpr_RdTmp(cntr2_tmp)));
+		addStmtToIRSB(
+			out,
+			IRStmt_WrTmp(
+				guard_tmp,
+				IRExpr_Binop(
+					Iop_CmpEQ64,
+					IRExpr_RdTmp(cntr2_tmp),
+					IRExpr_Const(
+						IRConst_U64(0)))));
+		run_period = unsafeIRDirty_0_N(
+			0,
+			(HChar *)"periodic_cb",
+			periodic_cb,
+			mkIRExprVec_0());
+		run_period->guard = IRExpr_RdTmp(guard_tmp);
+		addStmtToIRSB(
+			out,
+			IRStmt_Dirty(run_period));
+	}
 
 	instr_start = 0xdeadbabebeefface;
 	for (x = 0; x < inp->stmts_used; x++) {
@@ -812,6 +884,7 @@ ft2_post_clo_init(void)
 	if (!output_fname) {
 		VG_(tool_panic)((Char *)"need to know where to put the output!\n");
 	}
+	bb_cntr = periodic_work_period;
 }
 
 static IRSB *
@@ -1320,6 +1393,7 @@ ft2_process_command_line_option(Char *opt)
 		read_tag_dump(opt + VG_(strlen)("--input") + 1);
 		return True;
 	} else VG_BOOL_CLO(opt, "--stack-private", stack_is_private)
+	else VG_NUM_CLO(opt, "--period", periodic_work_period)
 	else {
 		return False;
 	}
