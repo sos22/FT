@@ -20,6 +20,8 @@
 
 #define PAGE_SIZE (4096ul)
 
+extern unsigned long main_exe_start, main_exe_end;
+
 #define NOISY 0
 
 struct write_file {
@@ -250,7 +252,9 @@ log_stores(IRSB *bb)
 	instr_start = 0xcafebabedeadbeef;
 	for (x = 0; x < bb->stmts_used; x++) {
 		stmt = bb->stmts[x];
-		if (stmt->tag != Ist_Store) {
+		if (instr_start < main_exe_start ||
+		    instr_start > main_exe_end ||
+		    stmt->tag != Ist_Store) {
 			addStmtToIRSB(out, stmt);
 		} else {
 			constructLoggingStore(out,
@@ -1050,38 +1054,46 @@ log_loads(IRSB *inp)
 	instr_start = 0xdeadbabebeefface;
 	for (x = 0; x < inp->stmts_used; x++) {
 		stmt = inp->stmts[x];
-		switch (stmt->tag) {
-		case Ist_IMark:
+		if (stmt->tag == Ist_IMark) {
 			instr_start = stmt->Ist.IMark.addr;
-			break;
-		case Ist_Put:
-			log_loads_expr(out, stmt->Ist.Put.data, instr_start);
-			if (stmt->Ist.Put.offset == OFFSET_amd64_RSP)
-				log_change_rsp(out, stmt->Ist.Put.data);
-			break;
-		case Ist_PutI:
-			log_loads_expr(out, stmt->Ist.PutI.ix, instr_start);
-			log_loads_expr(out, stmt->Ist.PutI.data, instr_start);
-			break;
-		case Ist_WrTmp:
-			log_loads_expr(out, stmt->Ist.WrTmp.data, instr_start);
-			break;
-		case Ist_Store:
-			log_loads_expr(out, stmt->Ist.Store.addr, instr_start);
-			log_loads_expr(out, stmt->Ist.Store.data, instr_start);
-			break;
-		case Ist_Dirty: {
-			int y;
-			log_loads_expr(out, stmt->Ist.Dirty.details->guard, instr_start);
-			for (y = 0; stmt->Ist.Dirty.details->args[y]; y++)
-				log_loads_expr(out, stmt->Ist.Dirty.details->args[y], instr_start);
-			break;
 		}
-		case Ist_Exit:
-			log_loads_expr(out, stmt->Ist.Exit.guard, instr_start);
-			break;
-		default:
-			break;
+		if (stmt->tag == Ist_Put &&
+		    stmt->Ist.Put.offset == OFFSET_amd64_RSP) {
+			log_change_rsp(out, stmt->Ist.Put.data);
+		}
+
+		if (instr_start >= main_exe_start && instr_start <= main_exe_end) {
+			switch (stmt->tag) {
+			case Ist_IMark:
+				break;
+			case Ist_Put:
+				log_loads_expr(out, stmt->Ist.Put.data, instr_start);
+				break;
+			case Ist_PutI:
+				log_loads_expr(out, stmt->Ist.PutI.ix, instr_start);
+				log_loads_expr(out, stmt->Ist.PutI.data, instr_start);
+				break;
+			case Ist_WrTmp:
+				log_loads_expr(out, stmt->Ist.WrTmp.data, instr_start);
+				break;
+			case Ist_Store:
+				log_loads_expr(out, stmt->Ist.Store.addr, instr_start);
+				log_loads_expr(out, stmt->Ist.Store.data, instr_start);
+				break;
+			case Ist_Dirty: {
+				int y;
+				log_loads_expr(out, stmt->Ist.Dirty.details->guard, instr_start);
+				for (y = 0; stmt->Ist.Dirty.details->args[y]; y++) {
+					log_loads_expr(out, stmt->Ist.Dirty.details->args[y], instr_start);
+				}
+				break;
+			}
+			case Ist_Exit:
+				log_loads_expr(out, stmt->Ist.Exit.guard, instr_start);
+				break;
+			default:
+				break;
+			}
 		}
 		addStmtToIRSB(out, stmt);
 	}

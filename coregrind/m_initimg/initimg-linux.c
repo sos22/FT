@@ -56,6 +56,8 @@
 #include <elf.h>
 /* --- !!! --- EXTERNAL HEADERS end --- !!! --- */
 
+unsigned long main_exe_start;
+unsigned long main_exe_end;
 
 /*====================================================================*/
 /*=== Find executable                                              ===*/
@@ -932,6 +934,9 @@ IIFinaliseImageInfo VG_(ii_create_image)( IICreateImageInfo iicii )
 
       setup_client_dataseg( dseg_max_size );
    }
+
+   main_exe_start = info.exe_base;
+   main_exe_end = info.exe_end;
 
    return iifii;
 }
