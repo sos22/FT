@@ -396,15 +396,15 @@ rips_equal(const struct rip_entry *re1, const struct rip_entry *re2)
 }
 
 static int
-rips_equal_modulo_privateness(const struct rip_entry *re1, const struct rip_entry *re2)
-{
-	return re1->content == re2->content;
-}
-
-static int
 rip_less_than(const struct rip_entry *re1, const struct rip_entry *re2)
 {
-	return re1->content < re2->content;
+	if (re1->content < re2->content) {
+		return 1;
+	} else if (re1->content > re2->content) {
+		return 0;
+	} else {
+		return re1->is_private < re2->is_private;
+	}
 }
 
 static void
@@ -765,12 +765,6 @@ log_change_rsp(IRSB *irsb, IRExpr *new_value)
 		       NULL);
 }
 
-static void
-clear_private_flag(struct rip_entry *re)
-{
-	re->is_private = 0;
-}
-
 static struct alias_table_entry *
 find_alias_table_entry(struct alias_table *at, const struct rip_entry *re)
 {
@@ -778,13 +772,12 @@ find_alias_table_entry(struct alias_table *at, const struct rip_entry *re)
 	unsigned head = hash % NR_AT_HEADS;
 	struct alias_table_entry *cursor;
 	for (cursor = at->heads[head]; cursor; cursor = cursor->next) {
-		if (rips_equal_modulo_privateness(&cursor->rip, re))
+		if (rips_equal(&cursor->rip, re))
 			return cursor;
 	}
 	cursor = VG_(malloc)("alias_table_entry", sizeof(*cursor));
 	cursor->next = at->heads[head];
 	copy_rip_entry(&cursor->rip, re);
-	clear_private_flag(&cursor->rip);
 	VG_(memset)(&cursor->aliases_with, 0, sizeof(cursor->aliases_with));
 	at->heads[head] = cursor;
 	return cursor;
