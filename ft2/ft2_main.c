@@ -14,6 +14,8 @@
 #include "pub_tool_clientstate.h"
 #include "pub_tool_options.h"
 
+#include "../coregrind/pub_core_libcproc.h"   // VG_(getpid)(), VG_(read_millisecond_timer()
+
 #include "libvex_guest_offsets.h"
 
 #include "valgrind.h"
@@ -87,6 +89,10 @@ static unsigned long
 bb_cntr;
 static unsigned long
 periodic_work_period;
+static const char *
+snapshot_prefix;
+static struct write_file
+snapshot_log;
 
 static void do_store(unsigned long addr, unsigned long data, unsigned long size,
 		     unsigned long rip);
@@ -272,8 +278,7 @@ static int
 open_write_file(struct write_file *out, const Char *fname)
 {
 	SysRes sr;
-
-	sr = VG_(open)(fname, VKI_O_WRONLY|VKI_O_CREAT|VKI_O_TRUNC, 0600);
+	sr = VG_(open)(fname, VKI_O_WRONLY | VKI_O_CREAT | VKI_O_TRUNC, 0600);
 	if (sr.isError)
 		return sr.err;
 	out->fd = sr.res;
@@ -961,9 +966,16 @@ periodic_cb(void)
 
 	bb_cntr = periodic_work_period;
 
-	VG_(sprintf)(fname, "snapshot%d", cntr);
+	VG_(sprintf)(fname, "%s%d.%d", snapshot_prefix, VG_(getpid)(), cntr);
 	cntr++;
-	VG_(printf)("Writing snapshot %s\n", fname);
+	if (snapshot_log.fd != -1) {
+		Char buf[128];
+		VG_(snprintf)(buf, 128, "%d: start snapshot %d at %d\n",
+			      VG_(getpid)(), cntr, VG_(read_millisecond_timer)());
+		write_file(&snapshot_log, buf, VG_(strlen)(buf));
+	}
+	VG_(printf)("Writing snapshot %s at %d\n", fname, VG_(read_millisecond_timer)());
+
 	dupe_alias_table(&snapshot_table, &global_alias_table);
 	for (x = 0; x < NR_ADDR_HASH_HEADS; x++) {
 		for (ahe = addr_hash_heads[x]; ahe; ahe = ahe->next) {
@@ -973,6 +985,12 @@ periodic_cb(void)
 	write_tag_dump(fname, &snapshot_table);
 	cleanup_alias_table(&snapshot_table);
 	VG_(printf)("Wrote snapshot\n");
+	if (snapshot_log.fd != -1) {
+		Char buf[128];
+		VG_(snprintf)(buf, 128, "%d: finish snapshot %d at %d\n",
+			      VG_(getpid)(), cntr, VG_(read_millisecond_timer)());
+		write_file(&snapshot_log, buf, VG_(strlen)(buf));
+	}
 }
 
 static IRSB *
@@ -1133,6 +1151,9 @@ ft2_fini(Int exitcode)
 
 	VG_(printf)("Finished writing results\n");
 
+	if (snapshot_log.fd != -1) {
+		close_write_file(&snapshot_log);
+	}
 }
 
 static void
@@ -1246,6 +1267,7 @@ release_memory_range(unsigned long start, unsigned long end)
 			    mte->tid != VG_(get_running_tid)()) {
 				VG_(printf)("DOOM: [%lx, %lx) should be private to %d, but was released from %d\n",
 					    start, end, mte->tid, VG_(get_running_tid)());
+				mte->tid = VG_INVALID_THREADID;
 			}
 			tl_assert(start == mte->start);
 			tl_assert(end == mte->end);
@@ -1309,6 +1331,7 @@ memory_location_is_private(unsigned long addr)
 			    mte->tid != VG_(get_running_tid)()) {
 				VG_(printf)("DOOM: lookup %lx: found [%lx, %lx) for thread %d, but we are thread %d?\n",
 					    addr, mte->start, mte->end, mte->tid, VG_(get_running_tid)());
+				mte->tid = VG_INVALID_THREADID;
 			}
 			return mte->tid != VG_INVALID_THREADID;
 		}
@@ -1464,7 +1487,7 @@ read_alias_table_entry(struct read_file *rfile, struct alias_table *at)
 }
 
 static void
-read_tag_dump(const Char *fname)
+read_tag_dump(const Char *fname, int allow_fail)
 {
 	static struct read_file rfile;
 	int err;
@@ -1473,7 +1496,11 @@ read_tag_dump(const Char *fname)
 	err = open_read_file(&rfile, fname);
 	if (err) {
 		VG_(printf)("%d opening %s\n", err, fname);
-		VG_(tool_panic)("Cannot read input file");
+		if (allow_fail) {
+			return;
+		} else {
+			VG_(tool_panic)("Cannot read input file");
+		}
 	}
 	if (read_file(&rfile, &magic, sizeof(magic)) != 0 ||
 	    magic != 0x1122334455) {
@@ -1493,7 +1520,21 @@ ft2_process_command_line_option(Char *opt)
 		output_fname = opt + VG_(strlen)("--output") + 1;
 		return True;
 	} else if (VG_CLO_STREQN(VG_(strlen)("--input")+1, opt, "--input=")) {
-		read_tag_dump(opt + VG_(strlen)("--input") + 1);
+		read_tag_dump(opt + VG_(strlen)("--input") + 1, 0);
+		return True;
+	} else if (VG_CLO_STREQN(VG_(strlen)("--input-opt")+1, opt, "--input-opt=")) {
+		read_tag_dump(opt + VG_(strlen)("--input-opt") + 1, 1);
+		return True;
+	} else if (VG_CLO_STREQN(VG_(strlen)("--snapshot")+1, opt, "--snapshot=")) {
+		snapshot_prefix = opt + VG_(strlen)("--snapshot") + 1;
+		return True;
+	} else if (VG_CLO_STREQN(VG_(strlen)("--snapshot-log")+1, opt, "--snapshot-log=")) {
+		char buf[512];
+		VG_(sprintf)(buf, "%s.%d", opt + VG_(strlen)("--snapshot-log") + 1, VG_(getpid)());
+		if (open_write_file(&snapshot_log, buf) != 0) {
+			VG_(printf)("Cannot open snapshot log %s\n", buf);
+			VG_(tool_panic)("Cannot open snapshot log\n");
+		}
 		return True;
 	} else VG_BOOL_CLO(opt, "--stack-private", stack_is_private)
 	else VG_NUM_CLO(opt, "--period", periodic_work_period)
@@ -1615,6 +1656,8 @@ static void* ms_realloc ( ThreadId tid, void* p_old, SizeT new_szB )
 
 static void ft2_pre_clo_init(void)
 {
+	snapshot_log.fd = -1;
+
 	VG_(details_name)("FT2");
 	VG_(details_version)(NULL);
 	VG_(details_description)("foo");
