@@ -15,6 +15,8 @@
 #include "pub_tool_options.h"
 
 #include "../coregrind/pub_core_libcproc.h"   // VG_(getpid)(), VG_(read_millisecond_timer()
+#include "../coregrind/pub_core_syscall.h"
+#include "vki/vki-scnums-amd64-linux.h"
 
 #include "libvex_guest_offsets.h"
 
@@ -970,8 +972,10 @@ periodic_cb(void)
 	cntr++;
 	if (snapshot_log.fd != -1) {
 		Char buf[128];
-		VG_(snprintf)(buf, 128, "%d: start snapshot %d at %d\n",
-			      VG_(getpid)(), cntr, VG_(read_millisecond_timer)());
+		struct vki_timeval tv_now;
+		VG_(do_syscall2)(__NR_gettimeofday, (UWord)&tv_now, (UWord)NULL);
+		VG_(snprintf)(buf, 128, "%d: %ld.%06ld: start snapshot %d\n",
+			      VG_(getpid)(), tv_now.tv_sec, tv_now.tv_usec, cntr);
 		write_file(&snapshot_log, buf, VG_(strlen)(buf));
 	}
 	VG_(printf)("Writing snapshot %s at %d\n", fname, VG_(read_millisecond_timer)());
@@ -987,8 +991,10 @@ periodic_cb(void)
 	VG_(printf)("Wrote snapshot\n");
 	if (snapshot_log.fd != -1) {
 		Char buf[128];
-		VG_(snprintf)(buf, 128, "%d: finish snapshot %d at %d\n",
-			      VG_(getpid)(), cntr, VG_(read_millisecond_timer)());
+		struct vki_timeval tv_now;
+		VG_(do_syscall2)(__NR_gettimeofday, (UWord)&tv_now, (UWord)NULL);
+		VG_(snprintf)(buf, 128, "%d: %ld.%06ld: finish snapshot %d\n",
+			      VG_(getpid)(), tv_now.tv_sec, tv_now.tv_usec, cntr);
 		write_file(&snapshot_log, buf, VG_(strlen)(buf));
 	}
 }
@@ -1136,6 +1142,7 @@ ft2_fini(Int exitcode)
 {
 	int x;
 	struct addr_hash_entry *ahe;
+	static Char lock_file[4096];
 
 	VG_(printf)("ft2_fini() starts\n");
 
@@ -1147,13 +1154,37 @@ ft2_fini(Int exitcode)
 
 	VG_(printf)("Done folding\n");
 
+	/* Acquire the lock */
+	VG_(sprintf)(lock_file, "%s.lock", output_fname);
+	while (1) {
+		SysRes sr;
+		sr = VG_(open)(lock_file, VKI_O_WRONLY | VKI_O_CREAT | VKI_O_EXCL, 0600);
+		if (sr.isError) {
+			if (sr.err == 17) {
+				VG_(printf)("Waiting for tags table lock\n");
+			} else {
+				VG_(printf)("Error %ld opening tag lock file", sr.err);
+				VG_(tool_panic)("Dead");
+			}
+		} else {
+			VG_(close)(sr.res);
+			break;
+		}
+	}
 	write_tag_dump(output_fname, &global_alias_table);
 
 	VG_(printf)("Finished writing results\n");
 
 	if (snapshot_log.fd != -1) {
+		struct vki_timeval tv_now;
+		char buf[128];
+		VG_(do_syscall2)(__NR_gettimeofday, (UWord)&tv_now, (UWord)NULL);
+		VG_(snprintf)(buf, 128, "%d: %ld.%06ld: wrote output\n",
+			      VG_(getpid)(), tv_now.tv_sec, tv_now.tv_usec);
+		write_file(&snapshot_log, buf, VG_(strlen)(buf));
 		close_write_file(&snapshot_log);
 	}
+	VG_(unlink)(lock_file);
 }
 
 static void
